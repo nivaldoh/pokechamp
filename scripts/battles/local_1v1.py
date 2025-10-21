@@ -4,9 +4,10 @@ import os
 import sys
 import argparse
 
-# Add the project root to Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
+# Ensure the project root is on the Python path
+project_root = os.path.abspath(os.path.dirname(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from common import *
 from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team
@@ -15,10 +16,19 @@ parser = argparse.ArgumentParser()
 
 # Player arguments
 parser.add_argument("--player_prompt_algo", default="io", choices=prompt_algos)
-parser.add_argument("--player_backend", type=str, default="gemini-2.5-flash", choices=[
+parser.add_argument(
+    "--player_algo",
+    dest="player_prompt_algo",
+    choices=prompt_algos,
+    default=argparse.SUPPRESS,
+    help="Alias for --player_prompt_algo",
+)
+parser.add_argument("--player_backend", type=str, default="gpt-5-mini", choices=[
     # OpenAI models
-    "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-    # Anthropic models
+    "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
+    # Anthropic Claude models (direct via Anthropic API)
+    "claude-sonnet-4-5", "claude-opus-4-1", "claude-sonnet-4", "claude-3-5-haiku",
+    # Anthropic models (via OpenRouter)
     "anthropic/claude-3.5-sonnet", "anthropic/claude-3-opus", "anthropic/claude-3-haiku",
     # Google models
     "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
@@ -44,10 +54,19 @@ parser.add_argument("--player_device", type=int, default=0)
 
 # Opponent arguments
 parser.add_argument("--opponent_prompt_algo", default="io", choices=prompt_algos)
-parser.add_argument("--opponent_backend", type=str, default="gemini-2.5-pro", choices=[
+parser.add_argument(
+    "--opponent_algo",
+    dest="opponent_prompt_algo",
+    choices=prompt_algos,
+    default=argparse.SUPPRESS,
+    help="Alias for --opponent_prompt_algo",
+)
+parser.add_argument("--opponent_backend", type=str, default="gemini-2.5-flash", choices=[
     # OpenAI models
     "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-    # Anthropic models
+    # Anthropic Claude models (direct via Anthropic API)
+    "claude-sonnet-4-5", "claude-opus-4-1", "claude-sonnet-4", "claude-3-5-haiku",
+    # Anthropic models (via OpenRouter)
     "anthropic/claude-3.5-sonnet", "anthropic/claude-3-opus", "anthropic/claude-3-haiku",
     # Google models
     "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
@@ -75,9 +94,31 @@ parser.add_argument("--opponent_device", type=int, default=0)
 parser.add_argument("--temperature", type=float, default=0.3)
 parser.add_argument("--battle_format", default="gen9ou", choices=["gen8randombattle", "gen8ou", "gen9ou", "gen9randombattle", "gen9vgc2024regg"])
 parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
-parser.add_argument("--N", type=int, default=25)
+parser.add_argument("--N", type=int, default=10)
 
 args = parser.parse_args()
+
+
+def _resolve_backend(backend: str, role: str) -> str:
+    lower = backend.lower()
+    if "gemini" in lower and not os.getenv("GEMINI_API_KEY"):
+        openrouter_key = os.getenv("OPENROUTER_API_KEY")
+        if openrouter_key:
+            fallback = "anthropic/claude-3-haiku"
+            print(
+                f"⚠️ GEMINI_API_KEY not set for {role}; falling back to {fallback} via OpenRouter."
+            )
+            return fallback
+        raise SystemExit(
+            f"Gemini backend selected for {role}, but GEMINI_API_KEY is missing. "
+            "Set GEMINI_API_KEY or choose --"
+            f"{role}_backend with a different provider."
+        )
+    return backend
+
+
+args.player_backend = _resolve_backend(args.player_backend, "player")
+args.opponent_backend = _resolve_backend(args.opponent_backend, "opponent")
 
 async def main():
     player = get_llm_player(args, 

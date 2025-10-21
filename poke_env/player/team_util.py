@@ -3,7 +3,7 @@ from poke_env.player.player import Player
 from poke_env.player.baselines import AbyssalPlayer, MaxBasePowerPlayer, OneStepPlayer
 from poke_env.player.random_player import RandomPlayer
 from poke_env.ps_client.account_configuration import AccountConfiguration
-from poke_env.ps_client.server_configuration import ShowdownServerConfiguration
+from poke_env.ps_client.server_configuration import ShowdownServerConfiguration, LocalhostServerConfiguration
 from poke_env.teambuilder import Teambuilder
 from numpy.random import randint
 import importlib
@@ -123,13 +123,16 @@ def get_llm_player(args,
                    PNUMBER1: str='', 
                    USERNAME: str='', 
                    PASSWORD: str='', 
-                   online: bool=False) -> Player:
+                   online: bool=False,
+                   assistant_backend: str = None,
+                   ) -> Player:
     from pokechamp.llm_player import LLMPlayer
     from pokechamp.prompts import prompt_translate, state_translate2
     
     server_config = None
     if online:
-        server_config = ShowdownServerConfiguration
+        # server_config = ShowdownServerConfiguration # manually swapping this for localhost server
+        server_config = LocalhostServerConfiguration
     if USERNAME == '':
         USERNAME = name
     if name == 'abyssal':
@@ -163,7 +166,9 @@ def get_llm_player(args,
                        server_configuration=server_config,
                        save_replays=args.log_dir,
                        device=device,
-                       llm_backend=llm_backend)
+                       llm_backend=llm_backend,
+                       main_backend=backend,
+                       assistant_backend=assistant_backend)
     elif 'pokechamp' in name:
         return LLMPlayer(battle_format=battle_format,
                        api_key=KEY,
@@ -179,7 +184,9 @@ def get_llm_player(args,
                     #    prompt_translate=prompt_translate,
                        prompt_translate=state_translate2,
                        device=device,
-                       llm_backend=llm_backend)
+                       llm_backend=llm_backend,
+                       main_backend=backend,
+                       assistant_backend=assistant_backend)
     else:
         # Try to find a custom bot in the bots folder
         custom_bot_class = get_custom_bot_class(name)
@@ -194,7 +201,9 @@ def get_llm_player(args,
                 server_configuration=server_config,
                 save_replays=args.log_dir,
                 device=device,
-                llm_backend=llm_backend
+                llm_backend=llm_backend,
+                main_backend=backend,
+                assistant_backend=assistant_backend
             )
         else:
             raise ValueError(f'Bot not found: {name}')
