@@ -6,5 +6,6 @@ for testing and battling in the PokéChamp framework.
 """
 
 from .starter_kit_bot import StarterKitBot
+from .mcp_bot import MCPBot
 
-__all__ = ['StarterKitBot'] 
+__all__ = ['StarterKitBot', 'MCPBot'] 

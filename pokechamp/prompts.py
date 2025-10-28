@@ -1,12 +1,12 @@
 
 from typing import Dict
 import numpy as np
-from poke_env.environment.battle import Battle
-from poke_env.environment.move import Move
-from poke_env.environment.move_category import MoveCategory
-from poke_env.environment.pokemon import Pokemon
-from poke_env.environment.side_condition import SideCondition
-from poke_env.player.local_simulation import LocalSim, move_type_damage_wrapper
+from pokechamp.poke_env_local.environment.battle import Battle
+from pokechamp.poke_env_local.environment.move import Move
+from pokechamp.poke_env_local.environment.move_category import MoveCategory
+from pokechamp.poke_env_local.environment.pokemon import Pokemon
+from pokechamp.poke_env_local.environment.side_condition import SideCondition
+from pokechamp.poke_env_local.player.local_simulation import LocalSim, move_type_damage_wrapper
 
 def get_turn_summary(sim: LocalSim,
                      battle: Battle,

@@ -5,13 +5,13 @@ import orjson
 import numpy as np
 from tqdm import tqdm
 
-from poke_env.player.baselines import MaxBasePowerPlayer, Human, OneStepPlayer, AbyssalPlayer
+from pokechamp.poke_env_local.player.baselines import MaxBasePowerPlayer, OneStepPlayer, AbyssalPlayer
 from pokechamp.depth_translate import data_battle
 from pokechamp.llm_player import LLMPlayer
-from poke_env.player.player import Player
+from pokechamp.poke_env_local.player.player import Player
 from pokechamp.prompts import prompt_translate, state_translate
 # from pokechamp.translate import add_battle
-from poke_env.ps_client.account_configuration import AccountConfiguration
+from pokechamp.poke_env_local.ps_client.account_configuration import AccountConfiguration
 
 system_prompt = (
                 "You are a pokemon battler that targets to win the pokemon battle. You can choose to take a move or switch in another pokemon. Here are some battle tips:"
@@ -134,7 +134,9 @@ def get_loadout_str(data, mon):
 
 async def hand_benchmark(args, PNUMBER1, total=1):
     # find 1v1 mons
-    file = f'poke_env/data/static/gen9/ou/sets_1500.json'
+    from pokechamp.poke_env_local.paths import STATIC_DIR
+
+    file = STATIC_DIR / 'gen9' / 'ou' / 'sets_1500.json'
     with open(file, 'r') as f:
         data = orjson.loads(f.read())
     available_mons = list(data.keys())
@@ -240,7 +242,9 @@ async def one_vs_one(args, PNUMBER1, total=1, compare_bots=False):
     1v1 Eval
     '''
     # find 1v1 mons
-    file = f'poke_env/data/static/gen9/ou/sets_1500.json'
+    from pokechamp.poke_env_local.paths import STATIC_DIR
+
+    file = STATIC_DIR / 'gen9' / 'ou' / 'sets_1500.json'
     with open(file, 'r') as f:
         data = orjson.loads(f.read())
     available_mons = list(data.keys())

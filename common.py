@@ -13,6 +13,7 @@ prompt_algos = [
     "heuristic", 
     'max_power',
     'one_step',
+    'mcp',
     'random'
     ]
 

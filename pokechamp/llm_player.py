@@ -8,18 +8,18 @@ import random
 import sys
 
 import numpy as np
-from poke_env.environment.abstract_battle import AbstractBattle
-from poke_env.environment.battle import Battle
-from poke_env.environment.double_battle import DoubleBattle
-from poke_env.environment.move_category import MoveCategory
-from poke_env.environment.pokemon import Pokemon
-from poke_env.environment.side_condition import SideCondition
-from poke_env.player.player import Player, BattleOrder
+from pokechamp.poke_env_local.environment.abstract_battle import AbstractBattle
+from pokechamp.poke_env_local.environment.battle import Battle
+from pokechamp.poke_env_local.environment.double_battle import DoubleBattle
+from pokechamp.poke_env_local.environment.move_category import MoveCategory
+from pokechamp.poke_env_local.environment.pokemon import Pokemon
+from pokechamp.poke_env_local.environment.side_condition import SideCondition
+from pokechamp.poke_env_local.player.player import Player, BattleOrder
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from poke_env.environment.move import Move
+from pokechamp.poke_env_local.environment.move import Move
 import time
 import json
-from poke_env.data.gen_data import GenData
+from pokechamp.poke_env_local.data.gen_data import GenData
 from pokechamp.gpt_player import GPTPlayer
 from pokechamp.llama_player import LLAMAPlayer
 from pokechamp.openrouter_player import OpenRouterPlayer
@@ -41,7 +41,7 @@ from pokechamp.minimax_optimizer import (
     create_battle_state_hash,
     OptimizedSimNode
 )
-from poke_env.player.local_simulation import LocalSim, SimNode
+from pokechamp.poke_env_local.player.local_simulation import LocalSim, SimNode
 from difflib import get_close_matches
 from pokechamp.prompts import get_number_turns_faint, get_status_num_turns_fnt, state_translate, get_gimmick_motivation
 
@@ -67,6 +67,7 @@ class LLMPlayer(Player):
                  main_backend: Optional[str] = None,
                  assistant_backend: Optional[str] = None,
                  log_level: int = logging.WARNING,
+                 use_metamon_value_function: Optional[bool] = True,
                  ):
 
         super().__init__(battle_format=battle_format,
@@ -144,6 +145,49 @@ class LLMPlayer(Player):
         self.use_damage_calc_early_exit = True  # Use damage calculator to exit early when advantageous
         self.use_llm_value_function = True  # Use LLM for leaf node evaluation (vs fast heuristic)
         self.max_depth_for_llm_eval = 2  # Only use LLM evaluation for shallow depths to save time
+        # Optional Metamon integration (replaces LLM eval)
+        if use_metamon_value_function is None:
+            use_metamon_value_function = os.getenv("POKECHAMP_USE_METAMON", "1") in {"1", "true", "True"}
+        self.use_metamon_value_function = bool(use_metamon_value_function)
+        if self.use_metamon_value_function:
+            # Disable LLM value if Metamon is enabled, but only after successful init
+            try:
+                from pokechamp import metamon_bridge as _mb
+                # Strict by default: require Metamon unless explicitly allowed to fall back
+                required_env = os.getenv("POKECHAMP_METAMON_REQUIRED", "1").lower()
+                metamon_required = required_env in {"1", "true", "t", "yes", "y"}
+                _mb.enable(os.getenv("POKECHAMP_METAMON_MODEL"), strict=metamon_required)
+                # If strict=False, still try to load model and check readiness
+                if not metamon_required:
+                    try:
+                        _mb.METAMON_BRIDGE._ensure_model()
+                    except Exception as _e2:
+                        print(f"[MetamonBridge] lazy model load failed: {_e2}")
+                ready, reason = _mb.METAMON_BRIDGE.is_ready()
+                if not ready:
+                    if metamon_required:
+                        raise RuntimeError(f"Metamon required but not ready: {reason}")
+                    else:
+                        print(f"[MetamonBridge] not ready (optional): {reason}. Falling back to LLM for leaf eval.")
+                        self.use_metamon_value_function = False
+                        self.use_llm_value_function = True
+                else:
+                    # Metamon ready; turn off LLM leaf eval
+                    self.use_llm_value_function = False
+                    cache_dir = os.getenv("METAMON_CACHE_DIR")
+                    model = os.getenv("POKECHAMP_METAMON_MODEL", "Abra")
+                    head = "loaded" if getattr(_mb.METAMON_BRIDGE, "_head_loaded", False) else "untrained"
+                    print(f"[MetamonBridge] enabled model={model} head={head} cache={cache_dir}")
+            except Exception as _e:
+                # Required path: raise and stop early
+                print(f"[MetamonBridge] initialization error: {_e}")
+                required_env = os.getenv("POKECHAMP_METAMON_REQUIRED", "1").lower()
+                metamon_required = required_env in {"1", "true", "t", "yes", "y"}
+                if metamon_required:
+                    raise
+                # Optional path: fallback to LLM leaves
+                self.use_metamon_value_function = False
+                self.use_llm_value_function = True
 
     def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None) -> str:
         if llm is None:
@@ -396,6 +440,7 @@ class LLMPlayer(Player):
                     temperature=self.temperature,
                     backend=self.backend,
                     use_llm_value_function=self.use_llm_value_function,
+                    use_metamon_value_function=self.use_metamon_value_function,
                     max_depth_for_llm_eval=self.max_depth_for_llm_eval,
                     _dynamax_disable=self._dynamax_disable,
                     prompt_translate=self.prompt_translate,

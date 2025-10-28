@@ -6,20 +6,21 @@ It uses tree search with opponent modeling to find optimal moves.
 """
 
 import json
+import os
 import time
 from collections import OrderedDict
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
-from poke_env.environment.abstract_battle import AbstractBattle
-from poke_env.environment.battle import Battle
-from poke_env.environment.move import Move
-from poke_env.environment.move_category import MoveCategory
-from poke_env.environment.pokemon import Pokemon
-from poke_env.player.battle_order import BattleOrder
-from poke_env.player.local_simulation import LocalSim, SimNode
-from poke_env.data.gen_data import GenData
+from pokechamp.poke_env_local.environment.abstract_battle import AbstractBattle
+from pokechamp.poke_env_local.environment.battle import Battle
+from pokechamp.poke_env_local.environment.move import Move
+from pokechamp.poke_env_local.environment.move_category import MoveCategory
+from pokechamp.poke_env_local.environment.pokemon import Pokemon
+from pokechamp.poke_env_local.player.battle_order import BattleOrder
+from pokechamp.poke_env_local.player.local_simulation import LocalSim, SimNode
+from pokechamp.poke_env_local.data.gen_data import GenData
 
 from pokechamp.decision_strategy import DecisionStrategy
 from pokechamp.minimax_optimizer import fast_battle_evaluation, create_battle_state_hash
@@ -60,6 +61,7 @@ class MinimaxStrategy(DecisionStrategy):
         _dynamax_disable: bool,
         prompt_translate: Callable,
 
+        # TODO: this is probably bad
         # Callable dependencies (from LLMPlayer)
         get_llm_action: Callable,
         io: Callable,
@@ -67,6 +69,8 @@ class MinimaxStrategy(DecisionStrategy):
         choose_max_damage_move: Callable,
         build_local_sim: Callable,
         llm_value: Any,
+        # Defaults must come last to satisfy Python's signature rules
+        use_metamon_value_function: bool = True,
     ):
         """
         Initialize the Minimax strategy with all dependencies.
@@ -109,6 +113,7 @@ class MinimaxStrategy(DecisionStrategy):
         self.temperature = temperature
         self.backend = backend
         self.use_llm_value_function = use_llm_value_function
+        self.use_metamon_value_function = use_metamon_value_function
         self.max_depth_for_llm_eval = max_depth_for_llm_eval
         self._dynamax_disable = _dynamax_disable
         self.prompt_translate = prompt_translate
@@ -266,7 +271,7 @@ class MinimaxStrategy(DecisionStrategy):
             return best_action, best_action_turns
 
         # Fallback to random move
-        from poke_env.player.player import Player
+            from pokechamp.poke_env_local.player.player import Player
         return Player.choose_random_move(None, battle), 1
 
     def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon) -> float:
@@ -310,11 +315,22 @@ class MinimaxStrategy(DecisionStrategy):
             opp_remaining = len([p for p in battle_state.opponent_team.values() if not p.fainted])
 
             # Use cached fast evaluation
-            return fast_battle_evaluation(
+            score = fast_battle_evaluation(
                 player_hp, opp_hp,
                 player_remaining, opp_remaining,
                 battle_state.turn
             )
+            # Optional debug: trace heuristic inputs
+            try:
+                _log_on = os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}
+                if _log_on:
+                    print(
+                        f"[Minimax] HeurEval: hp=(P:{player_hp} O:{opp_hp}) team=(P:{player_remaining} O:{opp_remaining}) turn={getattr(battle_state,'turn','?')} -> score={score}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+            return score
         except:
             # Ultimate fallback to basic hp difference
             try:
@@ -368,6 +384,37 @@ class MinimaxStrategy(DecisionStrategy):
         Returns:
             BattleOrder for best action (and optionally opponent action)
         """
+        # Lightweight logging toggle
+        _log_on = os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}
+        def _log(msg: str):
+            if _log_on:
+                try:
+                    print(f"[Minimax] {msg}", flush=True)
+                except Exception:
+                    pass
+
+        # Report Metamon readiness/requirement for clarity
+        metamon_required = os.getenv("POKECHAMP_METAMON_REQUIRED", "1").lower() in {"1", "true", "t", "yes", "y"}
+        metamon_ready = None
+        if self.use_metamon_value_function:
+            try:
+                from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                metamon_ready = _MB.is_ready()[0]
+            except Exception:
+                metamon_ready = False
+        _log(
+            f"Start turn={getattr(battle, 'turn', '?')} depth={self.K} "
+            f"metamon={self.use_metamon_value_function} required={metamon_required} ready={metamon_ready}"
+        )
+
+        # Optionally register live context with Metamon
+        try:
+            if self.use_metamon_value_function:
+                from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                _MB.ensure_registered(battle)
+        except Exception:
+            pass
+
         # Generate local simulation
         root = SimNode(
             battle,
@@ -385,10 +432,53 @@ class MinimaxStrategy(DecisionStrategy):
             sim=sim
         )
 
+        # Ensure root simulation has a cloned Metamon context from the live battle
+        try:
+            if self.use_metamon_value_function:
+                from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                # Clone once per search so child clones inherit a valid parent
+                _MB.clone_context(battle, root.simulation.battle)
+                if os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}:
+                    try:
+                        print(
+                            f"[Minimax] root clone parent_id={id(battle)} child_id={id(root.simulation.battle)}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         q = [root]
         leaf_nodes = []
         start_time = time.time()
 
+        # Leaf evaluation stats (kept minimal to avoid spam)
+        _leaf_count = 0
+        _leaf_metamon = 0
+        _leaf_heur = 0
+        _leaf_llm = 0
+        _leaf_scores = []
+        _leaf_samples = []  # up to 8 sample lines
+
+        def _path_of(node: SimNode) -> str:
+            # Build a short path string of player/opponent actions
+            steps = []
+            cur = node
+            while cur is not None and getattr(cur, 'parent_node', None) is not None:
+                try:
+                    if getattr(cur, 'action', None) is not None:
+                        steps.append(f"P:{str(cur.action.order)}")
+                    if getattr(cur, 'action_opp', None) is not None:
+                        steps.append(f"O:{str(cur.action_opp.order)}")
+                except Exception:
+                    break
+                cur = cur.parent_node
+            if not steps:
+                return "<root>"
+            return " | ".join(reversed(steps[-6:]))  # last few steps only
+
+        decision_method = "minimax"
         while len(q) != 0:
             node = q.pop(0)
             # Choose node for expansion
@@ -399,7 +489,24 @@ class MinimaxStrategy(DecisionStrategy):
             # End if terminal
             if node.simulation.is_terminal() or node.depth == self.K:
                 try:
-                    if self.use_llm_value_function and node.depth <= self.max_depth_for_llm_eval:
+                    leaf_src = "heur"
+                    if self.use_metamon_value_function:
+                        try:
+                            from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                            score = _MB.score(node.simulation.battle)
+                        except Exception:
+                            score = None
+                        if score is not None:
+                            node.hp_diff = score
+                            _leaf_metamon += 1
+                            _leaf_scores.append(score)
+                            leaf_src = "metamon"
+                        else:
+                            node.hp_diff = self._get_fast_heuristic_evaluation(node.simulation.battle)
+                            _leaf_heur += 1
+                            _leaf_scores.append(node.hp_diff)
+                            leaf_src = "heur"
+                    elif self.use_llm_value_function and node.depth <= self.max_depth_for_llm_eval:
                         cached_value = self._get_cached_llm_value(node.simulation.battle)
                         if cached_value is not None:
                             node.hp_diff = cached_value
@@ -428,9 +535,27 @@ class MinimaxStrategy(DecisionStrategy):
                             if not llm_action_json or 'score' not in llm_action_json:
                                 raise ValueError('Score not found in LLM response')
                             node.hp_diff = int(float(llm_action_json['score']))
+                            # Log concise LLM value result at root depth
+                            if _log_on and node.depth == 1:
+                                try:
+                                    # show only a short preview of raw output if it's text-like
+                                    preview = llm_output
+                                    if isinstance(preview, str):
+                                        preview = preview.strip().replace('\n', ' ')
+                                        if len(preview) > 120:
+                                            preview = preview[:120] + '…'
+                                    _log(f"LLM leaf eval: score={node.hp_diff} preview={preview}")
+                                except Exception:
+                                    pass
                             self._store_llm_value(node.simulation.battle, node.hp_diff)
+                        _leaf_llm += 1
+                        _leaf_scores.append(node.hp_diff)
+                        leaf_src = "llm"
                     else:
                         node.hp_diff = self._get_fast_heuristic_evaluation(node.simulation.battle)
+                        _leaf_heur += 1
+                        _leaf_scores.append(node.hp_diff)
+                        leaf_src = "heur"
                 except Exception as e:
                     try:
                         node.hp_diff = node.simulation.get_hp_diff()
@@ -439,6 +564,9 @@ class MinimaxStrategy(DecisionStrategy):
                     print(e)
 
                 leaf_nodes.append(node)
+                _leaf_count += 1
+                if _log_on and len(_leaf_samples) < 8:
+                    _leaf_samples.append(f"Leaf d={node.depth} score={node.hp_diff} src={leaf_src} path={_path_of(node)}")
                 continue
 
             # Estimate opponent action
@@ -457,7 +585,7 @@ class MinimaxStrategy(DecisionStrategy):
             ##############################
             # Generate player's actions  #
             ##############################
-            if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:
+            if not node.simulation.battle.active_pokemon.fainted and len(node.simulation.battle.available_moves) > 0:
                 # Get dmg calc move
                 dmg_calc_out, dmg_calc_turns = self.dmg_calc_move(node.simulation.battle)
                 if dmg_calc_out is not None:
@@ -509,6 +637,12 @@ Evaluate these factors and decide which method would be more beneficial in the c
                                 choice_value = llm_action_json.get('choice')
 
                             if isinstance(choice_value, str) and choice_value.lower() != 'minimax':
+                                decision_method = "damage_calc"
+                                if _log_on and node.depth == 1:
+                                    try:
+                                        _log(f"Decision method=damage_calc (LLM choice='{choice_value}') action={str(dmg_calc_out)}")
+                                    except Exception:
+                                        pass
                                 if return_opp:
                                     # Use tool to save time and llm when move makes bigger difference
                                     return dmg_calc_out, action_opp
@@ -532,12 +666,17 @@ Evaluate these factors and decide which method would be more beneficial in the c
                         node.simulation.battle,
                         node.simulation
                     )
+                    if _log_on and node.depth == 1 and i == 0:
+                        try:
+                            _log(f"LLM switch suggestion: {getattr(action_llm_switch, 'message', str(action_llm_switch))}")
+                        except Exception:
+                            pass
                     if len(player_actions) == 0:
                         player_actions.append(action_llm_switch)
                     elif action_llm_switch.message != player_actions[-1].message:
                         player_actions.append(action_llm_switch)
 
-            if not node.simulation.battle.active_pokemon.fainted and len(battle.available_moves) > 0:
+            if not node.simulation.battle.active_pokemon.fainted and len(node.simulation.battle.available_moves) > 0:
                 # Get llm move
                 state_action_prompt_move = state_action_prompt + action_prompt_move + '\nYou can only choose to move this turn.\n'
                 constraint_prompt_io = 'Choose the best action and your output MUST be a JSON like: {"move":"<move_name>"}.\n'
@@ -551,6 +690,11 @@ Evaluate these factors and decide which method would be more beneficial in the c
                     node.simulation.battle,
                     node.simulation
                 )
+                if _log_on and node.depth == 1:
+                    try:
+                        _log(f"LLM move suggestion: {getattr(action_llm_move, 'message', str(action_llm_move))}")
+                    except Exception:
+                        pass
                 if len(player_actions) == 0:
                     player_actions.append(action_llm_move)
                 elif action_llm_move.message != player_actions[0].message:
@@ -592,49 +736,130 @@ Evaluate these factors and decide which method would be more beneficial in the c
                 node.simulation,
                 dont_verify=True
             )
+            if _log_on and node.depth == 1:
+                try:
+                    _log(f"LLM opponent prediction: {getattr(action_o, 'message', str(action_o))}")
+                except Exception:
+                    pass
             is_repeat_action_o = np.array([action_o.message == opponent_action.message for opponent_action in opponent_actions]).any()
             if not is_repeat_action_o:
                 opponent_actions.append(action_o)
 
             # Simulate outcome
             if node.depth < self.K:
+                # Compact expansion log for shallow nodes
+                if _log_on and node.depth <= 2:
+                    try:
+                        _log(f"Expand d={node.depth} combos={len(player_actions)}x{len(opponent_actions)} -> {len(player_actions)*len(opponent_actions)} children")
+                    except Exception:
+                        pass
                 for action_p in player_actions:
                     for action_o in opponent_actions:
-                        node_new = copy(node)
-                        node_new.simulation.battle = copy(node.simulation.battle)
-                        node_new.children = []
-                        node_new.depth = node.depth + 1
+                        # Build a fresh child node with a distinct LocalSim and deepcopied Battle
+                        child_battle = deepcopy(node.simulation.battle)
+                        node_new = SimNode(
+                            child_battle,
+                            self.move_effect,
+                            self.pokemon_move_dict,
+                            self.ability_effect,
+                            self.pokemon_ability_dict,
+                            self.item_effect,
+                            self.pokemon_item_dict,
+                            self.gen,
+                            self._dynamax_disable,
+                            depth=node.depth + 1,
+                            format=self.format,
+                            prompt_translate=self.prompt_translate,
+                            sim=None,
+                        )
+                        # Clone Metamon context for the new battle branch
+                        try:
+                            if self.use_metamon_value_function:
+                                from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                                if _log_on and node.depth == 1:
+                                    try:
+                                        _log(
+                                            f"child-create parent_id={id(node.simulation.battle)} child_id={id(node_new.simulation.battle)} P={str(getattr(action_p,'order',action_p))} O={str(getattr(action_o,'order',action_o))}"
+                                        )
+                                    except Exception:
+                                        pass
+                                _MB.clone_context(node.simulation.battle, node_new.simulation.battle)
+                        except Exception:
+                            pass
                         node_new.action = action_p
                         node_new.action_opp = action_o
                         node_new.parent_node = node
                         node_new.parent_action = node.action
                         node.children.append(node_new)
                         node_new.simulation.step(action_p, action_o)
+                        if _log_on and node.depth == 1:
+                            try:
+                                _log(f"child-step child_id={id(node_new.simulation.battle)}")
+                            except Exception:
+                                pass
                         q.append(node_new)
 
         # Choose best action according to max or min rule
-        def get_tree_action(root: SimNode):
-            if len(root.children) == 0:
-                return root.action, root.hp_diff, root.action_opp
+        root_ref = root
+        root_summary = {}
+        root_actions = {}
+        root_opp = {}
+        def get_tree_action(node: SimNode):
+            # Base case: leaf node
+            if len(node.children) == 0:
+                return node.action, node.hp_diff, node.action_opp
             score_dict = {}
             action_dict = {}
             opp_dict = {}
-            for child in root.children:
+            for child in node.children:
                 action = str(child.action.order)
                 _, score, _ = get_tree_action(child)
                 if action in score_dict.keys():
-                    # Minimax
+                    # Minimax: worst-case over opponent replies
                     score_dict[action] = min(score, score_dict[action])
                 else:
                     score_dict[action] = score
                     action_dict[action] = child.action
                     opp_dict[action] = child.action_opp
-            scores = list(score_dict.values())
-            best_action_str = list(action_dict.keys())[np.argmax(scores)]
+            # Choose the action that maximizes the minimax value
+            best_action_str = max(score_dict.keys(), key=lambda k: score_dict[k])
+            # Capture root-level summary for logging
+            if _log_on and node is root_ref:
+                nonlocal root_summary, root_actions, root_opp
+                root_summary = score_dict.copy()
+                root_actions = action_dict.copy()
+                root_opp = opp_dict.copy()
             return action_dict[best_action_str], score_dict[best_action_str], opp_dict[best_action_str]
 
-        action, _, action_opp = get_tree_action(root)
+        action, best_score, action_opp = get_tree_action(root)
         end_time = time.time()
+
+        # Release ephemeral Metamon contexts created during this search
+        try:
+            if self.use_metamon_value_function:
+                from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                _MB.release_ephemeral()
+        except Exception:
+            pass
+
+        # Emit compact logs
+        if _log_on:
+            try:
+                if _leaf_scores:
+                    _log(f"Leaves={_leaf_count} metamon={_leaf_metamon} heur={_leaf_heur} llm={_leaf_llm} min={min(_leaf_scores)} max={max(_leaf_scores)} avg={sum(_leaf_scores)/max(1,len(_leaf_scores)):.1f}")
+                for line in _leaf_samples:
+                    _log(line)
+                if root_summary:
+                    # Log every immediate root branch score (worst-case over opp replies)
+                    for a, s in sorted(root_summary.items(), key=lambda kv: kv[1], reverse=True):
+                        opp = root_opp.get(a)
+                        opp_s = f" vs_opp={str(opp.order)}" if opp else ""
+                        _log(f"Branch {a} -> minimax={s}{opp_s}")
+                # Chosen action
+                _log(f"Chosen action {str(action.order)} score={best_score} vs_opp={str(action_opp.order) if action_opp else 'None'} elapsed={end_time-start_time:.2f}s")
+                _log(f"Decision method={decision_method}")
+            except Exception:
+                pass
 
         if return_opp:
             return action, action_opp

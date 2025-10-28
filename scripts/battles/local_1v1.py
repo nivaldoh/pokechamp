@@ -10,12 +10,15 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from common import *
-from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team
+# from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team
+from pokechamp.poke_env_local.player.team_util import (
+    get_llm_player, get_metamon_teams, load_random_team
+)
 
 parser = argparse.ArgumentParser()
 
 # Player arguments
-parser.add_argument("--player_prompt_algo", default="io", choices=prompt_algos)
+parser.add_argument("--player_prompt_algo", default="minimax", choices=prompt_algos)
 parser.add_argument(
     "--player_algo",
     dest="player_prompt_algo",
@@ -23,7 +26,7 @@ parser.add_argument(
     default=argparse.SUPPRESS,
     help="Alias for --player_prompt_algo",
 )
-parser.add_argument("--player_backend", type=str, default="gpt-5-mini", choices=[
+parser.add_argument("--player_backend", type=str, default="gemini-2.0-flash", choices=[
     # OpenAI models
     "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
     # Anthropic Claude models (direct via Anthropic API)
@@ -93,8 +96,8 @@ parser.add_argument("--opponent_device", type=int, default=0)
 # Shared arguments
 parser.add_argument("--temperature", type=float, default=0.3)
 parser.add_argument("--battle_format", default="gen9ou", choices=["gen8randombattle", "gen8ou", "gen9ou", "gen9randombattle", "gen9vgc2024regg"])
-parser.add_argument("--log_dir", type=str, default="./battle_log/one_vs_one")
-parser.add_argument("--N", type=int, default=10)
+parser.add_argument("--log_dir", type=str, default="./battle_log/")
+parser.add_argument("--N", type=int, default=1)
 
 args = parser.parse_args()
 

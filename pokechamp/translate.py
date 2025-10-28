@@ -2,11 +2,11 @@ import string
 import numpy as np
 import ast
 
-from poke_env.environment.move import Move
+from pokechamp.poke_env_local.environment.move import Move
 from pokechamp.llm_player import LLMPlayer
-from poke_env.player.local_simulation import LocalSim
+from pokechamp.poke_env_local.player.local_simulation import LocalSim
 from pokechamp.prompts import prompt_translate as pt
-from poke_env.ps_client.account_configuration import AccountConfiguration
+from pokechamp.poke_env_local.ps_client.account_configuration import AccountConfiguration
 
 def recursive_nick_removal(text, start=0):
     """Recursively replace nicknames with actual Pokémon names."""

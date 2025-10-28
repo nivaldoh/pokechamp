@@ -14,7 +14,11 @@ from collections import defaultdict, Counter
 from dataclasses import dataclass
 from tqdm import tqdm
 
-from poke_env.player.team_util import get_metamon_teams
+# Prefer the local forked poke_env utilities used by Pokéchamp
+try:
+    from pokechamp.poke_env_local.player.team_util import get_metamon_teams
+except Exception:  # fallback if running outside Pokéchamp tree
+    from poke_env.player.team_util import get_metamon_teams  # type: ignore
 
 
 @dataclass

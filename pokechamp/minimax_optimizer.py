@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
-from poke_env.environment.battle import Battle
-from poke_env.player.battle_order import BattleOrder
-from poke_env.player.local_simulation import LocalSim
+from pokechamp.poke_env_local.environment.battle import Battle
+from pokechamp.poke_env_local.player.battle_order import BattleOrder
+from pokechamp.poke_env_local.player.local_simulation import LocalSim
 
 
 @dataclass

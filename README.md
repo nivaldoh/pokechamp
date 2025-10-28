@@ -84,6 +84,7 @@ node pokemon-showdown start --no-security
 
 ### Built-in Bots
 - `pokechamp` - Main PokéChamp agent using minimax algorithm
+- `mcp` - MCP-powered bot that exercises tool-calling prompts
 - `pokellmon` - LLM-based agent with various prompt algorithms
 - `abyssal` - Abyssal Bot baseline
 - `max_power` - Maximum base power move selection
@@ -133,6 +134,88 @@ python local_1v1.py --player_backend anthropic/claude-3-haiku --opponent_backend
 # Test different models
 python local_1v1.py --player_backend mistralai/mixtral-8x7b-instruct --opponent_backend gpt-4o
 ```
+
+## 🔌 MCP Tooling
+
+MCP (Model Context Protocol) lets supported LLMs query battle information on demand.
+
+```sh
+# Enable MCP for the main agent
+python local_1v1.py --player_name pokechamp --player_algo mcp --opponent_name random
+
+# Try the dedicated MCP bot
+python local_1v1.py --player_name mcp --player_backend gpt-4o --opponent_name random
+```
+
+Key files:
+- `pokechamp/mcp_server.py` – tool/resource definitions exposed to the LLM
+- `pokechamp/mcp_client.py` – client wrapper (stdio + in-memory testing)
+- `pokechamp/mcp_prompts.py` – MCP-specific prompt templates and hints
+- `bots/mcp_bot.py` – reference bot that restricts tools to a curated subset
+
+### Battle Snapshot Resource
+
+All state previously exposed via `battle://state` and `battle://team` is now consolidated into a single deterministic resource:
+
+- `battle://snapshot` – complete, structured battle state for Gen 9 OU.
+
+Example output:
+
+```json
+{
+  "turn": 42,
+  "can_dynamax": false,
+  "can_tera": true,
+  "field": {
+    "weather": {"kind": "sun", "turns_left": 3},
+    "terrain": {"kind": "psychic", "turns_left": 2},
+    "screens_self": {"reflect": 0, "light_screen": 3, "veil": 0},
+    "screens_opp": {"reflect": 0, "light_screen": 0, "veil": 0},
+    "trick_room": 0,
+    "tailwind_self": 0,
+    "tailwind_opp": 0,
+    "hazards_self": {"sr": true, "spikes": 1, "tspikes": 0, "web": false},
+    "hazards_opp": {"sr": true, "spikes": 2, "tspikes": 0, "web": false}
+  },
+  "active_self": {
+    "species": "Great Tusk",
+    "types": ["Ground", "Fighting"],
+    "hp_pct": 72,
+    "status": null,
+    "fainted": false,
+    "ability": "Protosynthesis",
+    "item": "Booster Energy",
+    "boosts": {"atk": 0, "def": 1, "spa": 0, "spd": 0, "spe": 0},
+    "tera": {"available": true, "type": null}
+  },
+  "active_opp": {
+    "species": "Gholdengo",
+    "types": ["Steel", "Ghost"],
+    "hp_pct": 88,
+    "status": null,
+    "fainted": false,
+    "ability": "Good As Gold",
+    "item": null,
+    "boosts": {"spa": 0, "spe": 0},
+    "tera": {"used": false}
+  },
+  "teams": {
+    "self_known": [
+      {"species": "Great Tusk", "types": ["Ground", "Fighting"], "hp_pct": 72, "status": null, "fainted": false, "active": true, "ability": "Protosynthesis", "item": "Booster Energy", "revealed": true, "moves": ["headlongrush", "rapidspin"]}
+    ],
+    "opp_revealed": [
+      {"species": "Gholdengo", "types": ["Steel", "Ghost"], "hp_pct": 88, "status": null, "fainted": false, "active": true, "ability": "Good As Gold", "item": null, "revealed": true, "moves": ["makeitrain"]}
+    ]
+  },
+  "history": [
+    {"turn": 41, "self_action": "U-turn", "opp_action": "Make It Rain", "notes": null}
+  ]
+}
+```
+
+Notes:
+- Durations are deterministic and computed from turn counters with base values (Gen 9): weather/terrain/screens = 5, tailwind = 4, trick room = 5.
+- Ability and item names are shown when revealed; otherwise they appear as null.
 
 ## 🔮 Bayesian Prediction System
 

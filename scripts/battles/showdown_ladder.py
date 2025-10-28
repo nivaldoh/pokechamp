@@ -1,14 +1,15 @@
 import asyncio
 from tqdm import tqdm
 import argparse
-import os, sys
-
-# Add the current directory to Python path (since we're in project root)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
+import os
 from common import *
-from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team, TeamSet
+# poke_env local files are incomplete and don't have everything metamon requires when integrating both codebases
+# so the solution was to pip install poke-env separately but still keep the local modifications in a different folder
+# to avoid shadowing.
+# from poke_env.player.team_util import get_llm_player, get_metamon_teams, load_random_team, TeamSet
+from pokechamp.poke_env_local.player.team_util import (
+    get_llm_player, get_metamon_teams, load_random_team, TeamSet
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--temperature", type=float, default=0.5)
