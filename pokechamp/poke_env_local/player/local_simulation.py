@@ -130,9 +130,12 @@ class LocalSim():
                  _dynamax_disable: bool,
                 _strategy: str='',
                 format: str='gen9randombattle',
-                prompt_translate: Callable=None
+                prompt_translate: Callable=None,
+                *,
+                copy_battle: bool = True,
         ):
-        self.battle = deepcopy(battle)
+        # Allow caller to pass an already-copied Battle to avoid redundant deepcopy
+        self.battle = deepcopy(battle) if copy_battle else battle
         self.move_effect = move_effect
         self.pokemon_move_dict = pokemon_move_dict
         self.ability_effect = ability_effect
@@ -1823,6 +1826,8 @@ class SimNode():
                  format='gen9randombattle',
                  prompt_translate=None,
                  sim=None,
+                 *,
+                 copy_battle: bool = True,
                 ):
         if sim is None:
             self.simulation = LocalSim(battle, 
@@ -1836,6 +1841,7 @@ class SimNode():
                                     _dynamax_disable,
                                     format=format,
                                     prompt_translate=prompt_translate,
+                                    copy_battle=copy_battle,
                                     )
         else:
             self.simulation = sim

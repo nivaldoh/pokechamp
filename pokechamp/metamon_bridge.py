@@ -6,7 +6,7 @@ Design goals
 - Do not modify poke_env. Install lightweight monkey‑patches at runtime.
 - Keep one context per Python Battle instance (keyed by id(battle)).
 - Maintain a live root context from real server traffic; clone it for branches.
-- Provide score(battle) -> int in [0, 100] using a pretrained Metamon model.
+- Provide score(battle) -> float in [0, 100] using a pretrained Metamon model.
 
 Notes
 - Default model is tuned for Gen 9 and uses DefaultObservationSpace‑v1 tokens via
@@ -23,6 +23,7 @@ from typing import Dict, Optional, Any
 
 import numpy as np
 import traceback
+import json
 
 try:
     import torch
@@ -33,6 +34,11 @@ except Exception:  # pragma: no cover - optional at import time
 from metamon.env.metamon_battle import MetamonBackendBattle
 from metamon.rl.pretrained import get_pretrained_model
 from metamon.rl.win_probability_head import WinProbabilityHead
+try:
+    # Timestep-only head (optional import)
+    from metamon.rl.timestep_win_probability_head import MetamonTstepWinProbAgent  # type: ignore
+except Exception:  # pragma: no cover
+    MetamonTstepWinProbAgent = None  # type: ignore
 from metamon.interface import UniversalState
 from pokechamp.metamon_normalizer import SimProtocolNormalizer
 
@@ -75,6 +81,9 @@ class MetamonBridge:
         self._rl2_width: Optional[int] = None
         self._head: Optional[WinProbabilityHead] = None
         self._head_loaded: bool = False
+        # Timestep-only head agent (alternative to trajectory-based scoring)
+        self._tstep_agent = None
+        self._tstep_head_loaded: bool = False
 
         # Cache hooks (per-target)
         self._patched: Dict[str, bool] = {}
@@ -83,12 +92,19 @@ class MetamonBridge:
         # Pre-log sequence counters per battle
         self._prelog_seq: Dict[int, int] = {}
 
+        # (Removed) Lightweight runtime stats and psutil-based memory snapshots
+        # These were previously used for ad-hoc instrumentation and health logs.
+
         # Configuration
         self._model_name = os.getenv("POKECHAMP_METAMON_MODEL", "Abra")
         self._winprob_ckpt = os.getenv("METAMON_WINPROB_CKPT")
+        self._tstep_ckpt = os.getenv("POKECHAMP_METAMON_TSTEP_CKPT") or os.getenv("METAMON_TSTEP_CKPT")
         self._debug = str(os.getenv("POKECHAMP_METAMON_DEBUG", "")).lower() in {"1", "true", "t", "yes", "y"}
         # LocalSim normalization layer
         self._normalizer = SimProtocolNormalizer()
+        # Mode: 'timestep' (default) or 'traj'
+        mode_env = str(os.getenv("POKECHAMP_METAMON_MODE", "timestep")).strip().lower()
+        self._mode = "traj" if mode_env in {"traj", "trajectory", "sequence"} else "timestep"
 
     # -------- Debug helper --------
     def _dbg(self, *args: Any, **kwargs: Any) -> None:
@@ -107,6 +123,144 @@ class MetamonBridge:
                 print(f"[MetamonBridge] {prefix}: {etype}: {msg}\n{tb}", flush=True)
             except Exception:
                 pass
+
+    # -------- Failure diagnostics helpers (debug only) --------
+    def _battle_snapshot(self, battle) -> Dict[str, Any]:
+        try:
+            act = getattr(battle, "active_pokemon", None)
+            opp = getattr(battle, "opponent_active_pokemon", None)
+            def _mon(m):
+                if m is None:
+                    return None
+                try:
+                    return {
+                        "species": getattr(m, "species", None),
+                        "base_species": getattr(m, "base_species", None),
+                        "hp": getattr(m, "current_hp", None),
+                        "max_hp": getattr(m, "max_hp", None),
+                        "status": getattr(m, "status", None).name if getattr(m, "status", None) is not None else None,
+                        "moves_len": len(getattr(m, "moves", {}) or {}),
+                        "known_moves": list((getattr(m, "moves", {}) or {}).keys())[:4],
+                    }
+                except Exception:
+                    return {"species": getattr(m, "species", None)}
+
+            snap = {
+                "battle_id": id(battle),
+                "battle_tag": getattr(battle, "battle_tag", None),
+                "module": getattr(battle, "__module__", None),
+                "class": battle.__class__.__name__,
+                "turn": getattr(battle, "turn", None),
+                "in_team_preview": getattr(battle, "in_team_preview", None),
+                "teampreview": getattr(battle, "_teampreview", None),
+                "player_role": getattr(battle, "player_role", None),
+                "opponent_role": getattr(battle, "opponent_role", None),
+                "force_switch": getattr(battle, "force_switch", None),
+                "force_switch_type": type(getattr(battle, "force_switch", None)).__name__,
+                "reviving": getattr(battle, "reviving", None),
+                "can_tera": getattr(battle, "can_tera", None) is not None,
+                "has_teampreview_attr": hasattr(battle, "teampreview_opponent_team"),
+                "has__teampreview_attr": hasattr(battle, "_teampreview_opponent_team"),
+                "available_moves_len": len(getattr(battle, "available_moves", []) or []),
+                "available_switches_len": len(getattr(battle, "available_switches", []) or []),
+                "active": _mon(act),
+                "opponent": _mon(opp),
+            }
+            try:
+                sw = getattr(battle, "available_switches", []) or []
+                snap["switches"] = [getattr(p, "species", None) for p in sw][:6]
+            except Exception:
+                pass
+            return snap
+        except Exception:
+            return {"error": "snapshot_failed"}
+
+    def _dump_tstep_fail(
+        self,
+        phase: str,
+        battle,
+        ustate: Optional["UniversalState"],
+        exception: BaseException,
+    ) -> None:
+        if not self._debug:
+            return
+        try:
+            log_dir = os.path.join("scripts", "battles", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, "metamon_tstep_fail.jsonl")
+            rec: Dict[str, Any] = {
+                "phase": phase,
+                "error": type(exception).__name__,
+                "message": str(exception),
+                "battle_tag": getattr(battle, "battle_tag", None),
+                "turn": getattr(battle, "turn", None),
+                "mode": getattr(self, "_mode", None),
+            }
+            try:
+                rec["snapshot"] = self._battle_snapshot(battle)
+            except Exception:
+                pass
+            if ustate is not None:
+                try:
+                    rec["ustate"] = ustate.to_dict()
+                except Exception:
+                    rec["ustate"] = "<serialize_failed>"
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            # Never raise from logging
+            pass
+
+    def _log_observation_debug(self, ustate: "UniversalState") -> None:
+        """Attempt to compute and log base/text/tokenization stats after an obs failure."""
+        if not self._debug:
+            return
+        try:
+            obs_space = getattr(self, "_obs_space", None)
+            if obs_space is None:
+                return
+            base = getattr(obs_space, "base_obs_space", None)
+            if base is None:
+                return
+            base_obs = base.state_to_obs(ustate)
+            keys = list(base_obs.keys())
+            shapes = {k: (None if not hasattr(v, "shape") else tuple(getattr(v, "shape"))) for k, v in base_obs.items()}
+            self._dbg(f"base_obs keys={keys} shapes={shapes}")
+            # numbers length
+            try:
+                nums = base_obs.get("numbers")
+                if nums is not None:
+                    self._dbg(f"base numbers len={int(nums.shape[-1])} sample={np.asarray(nums)[...,:8].tolist() if np.ndim(nums)>0 else 'NA'}")
+            except Exception:
+                pass
+            # text/tokenization
+            try:
+                if "text" in base_obs:
+                    text = base_obs["text"]
+                    try:
+                        s = text.item() if hasattr(text, "item") else str(text)
+                    except Exception:
+                        s = str(text)
+                    words = s.split()
+                    self._dbg(f"base text words={len(words)} head={' '.join(words[:16])}")
+                    tok_len = None
+                    try:
+                        tok_len = base.tokenizable.get("text")
+                    except Exception:
+                        pass
+                    tokenizer = getattr(obs_space, "tokenizer", None)
+                    if tokenizer is not None:
+                        try:
+                            t = tokenizer.tokenize(np.array(s, dtype=np.str_).tolist())
+                            t = np.asarray(t)
+                            unk = int(np.sum(t == getattr(__import__('metamon.tokenizer', fromlist=['UNKNOWN_TOKEN']), 'UNKNOWN_TOKEN', -1)))
+                            self._dbg(f"tokenized len={int(t.shape[-1])} expected={tok_len} unk={unk} head={t[:16].tolist()}")
+                        except Exception as e:
+                            self._dbg(f"tokenizer.tokenize failed: {e}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # -------- Model loading --------
     def _ensure_model(self):
@@ -132,28 +286,52 @@ class MetamonBridge:
         # Infer rl2 width from tstep encoder (robust to architectural changes)
         extra = getattr(self._agent.tstep_encoder, "extra_emb", None)
         self._rl2_width = int(getattr(extra, "in_features", getattr(self._agent.tstep_encoder, "rl2_width", 1)))
-        # Small MLP head for win probability
-        self._head = WinProbabilityHead(state_dim=self._agent.traj_encoder.emb_dim)
-        # Optionally load trained win-probability head
-        self._head_loaded = False
-        if self._winprob_ckpt:
+        if self._mode == "traj":
+            # Trajectory-based: small MLP head on top of traj encoder output
+            self._head = WinProbabilityHead(state_dim=self._agent.traj_encoder.emb_dim)
+            self._head_loaded = False
+            if self._winprob_ckpt:
+                try:
+                    ckpt = torch.load(self._winprob_ckpt, map_location=self._device)
+                    state = ckpt.get("head_state_dict") if isinstance(ckpt, dict) else None
+                    if state:
+                        missing, unexpected = self._head.load_state_dict(state, strict=False)
+                        if missing or unexpected:
+                            self._dbg(f"Loaded head with missing={missing} unexpected={unexpected}")
+                        self._head_loaded = True
+                    else:
+                        self._dbg("WinProb checkpoint missing 'head_state_dict'; using randomly initialized head")
+                except Exception as e:
+                    self._dbg(f"Failed to load winprob head from {self._winprob_ckpt}: {e}")
+            self._head.eval()
             try:
-                ckpt = torch.load(self._winprob_ckpt, map_location=self._device)
-                state = ckpt.get("head_state_dict") if isinstance(ckpt, dict) else None
-                if state:
-                    missing, unexpected = self._head.load_state_dict(state, strict=False)
-                    if missing or unexpected:
-                        self._dbg(f"Loaded head with missing={missing} unexpected={unexpected}")
-                    self._head_loaded = True
-                else:
-                    self._dbg("WinProb checkpoint missing 'head_state_dict'; using randomly initialized head")
+                self._head.to(self._device)
+            except Exception:
+                pass
+        else:
+            # Timestep-only mode: attach head on top of timestep encoder
+            if MetamonTstepWinProbAgent is None:
+                raise RuntimeError("Timestep head not available; import failed")
+            try:
+                self._tstep_agent = MetamonTstepWinProbAgent(base_agent=self._agent)
+                # Optional: load separately trained tstep head
+                if self._tstep_ckpt:
+                    try:
+                        ckpt = torch.load(self._tstep_ckpt, map_location=self._device)
+                        state = ckpt.get("head_state_dict") if isinstance(ckpt, dict) else None
+                        if state:
+                            self._tstep_agent.head.load_state_dict(state, strict=False)
+                            self._tstep_head_loaded = True
+                        else:
+                            self._dbg("Timestep head checkpoint missing 'head_state_dict'; using randomly initialized head")
+                    except Exception as e:
+                        self._dbg(f"Failed to load timestep head from {self._tstep_ckpt}: {e}")
+                try:
+                    self._tstep_agent.to(self._device)
+                except Exception:
+                    pass
             except Exception as e:
-                self._dbg(f"Failed to load winprob head from {self._winprob_ckpt}: {e}")
-        self._head.eval()
-        try:
-            self._head.to(self._device)
-        except Exception:
-            pass
+                raise RuntimeError(f"Failed to initialize timestep winprob agent: {e}")
         # One-time model summary for debugging
         try:
             base_n = int(self._obs_space.gym_space["numbers"].shape[0])
@@ -164,6 +342,38 @@ class MetamonBridge:
             )
         except Exception:
             pass
+        # Additional environment summary
+        if self._debug:
+            try:
+                dev = str(self._device)
+                has_cuda = False
+                try:
+                    has_cuda = bool(torch.cuda.is_available())
+                except Exception:
+                    pass
+                try:
+                    space = self._obs_space
+                    cls = type(space).__name__
+                    gym_space = getattr(space, "gym_space", None)
+                    if gym_space is not None and hasattr(gym_space, "spaces"):
+                        gs = {k: (type(v).__name__, getattr(v, "shape", None)) for k, v in gym_space.spaces.items()}
+                    else:
+                        gs = "<unknown>"
+                    tok_len = None
+                    vocab = None
+                    # TokenizedObservationSpace exposes tokenizer and base_obs_space
+                    if hasattr(space, "base_obs_space"):
+                        tok_len = getattr(space.base_obs_space, "tokenizable", {}).get("text")
+                    if hasattr(space, "tokenizer"):
+                        try:
+                            vocab = len(space.tokenizer)
+                        except Exception:
+                            vocab = "<unknown>"
+                    self._dbg(f"device={dev} cuda={has_cuda} obs_space={cls} gym={gs} token_len={tok_len} vocab={vocab}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     # -------- Hook installation --------
     def install_hooks(self):
@@ -171,6 +381,10 @@ class MetamonBridge:
 
         Safe to call multiple times; installs once per target family.
         """
+        # Timestep mode does not need any mirroring hooks
+        if getattr(self, "_mode", "timestep") == "timestep":
+            self._installed = True
+            return
 
         def _iter_targets():
             # pip-installed poke_env
@@ -222,6 +436,18 @@ class MetamonBridge:
                     pass
                 # Run original first to keep engine behavior authoritative
                 _orig(this, split_message)
+                # Optionally dump local Pokechamp state after parsing
+                try:
+                    dump = getattr(this, "_pc_dump_state", None)
+                    if callable(dump):
+                        evt = None
+                        try:
+                            evt = split_message[1] if isinstance(split_message, list) and len(split_message) > 1 else None
+                        except Exception:
+                            evt = None
+                        dump("parse_message", event=evt)
+                except Exception:
+                    pass
                 try:
                     self.on_message(this, split_message, source=tag)
                 except Exception as e:
@@ -251,6 +477,13 @@ class MetamonBridge:
                 except Exception:
                     pass
                 _orig(this, request)
+                # Optionally dump local Pokechamp state after request parse
+                try:
+                    dump = getattr(this, "_pc_dump_state", None)
+                    if callable(dump):
+                        dump("parse_request", event="request")
+                except Exception:
+                    pass
                 try:
                     self.on_request(this, request, source=tag)
                 except Exception as e:
@@ -275,13 +508,24 @@ class MetamonBridge:
                 return False, "model_not_loaded"
             if self._obs_space is None or self._rl2_width is None:
                 return False, "observation_space_not_ready"
-            if self._head is None:
-                return False, "head_missing"
-            if not self._head_loaded and not allow_untrained:
-                return False, "head_not_loaded_set_METAMON_WINPROB_CKPT_or_allow_untrained"
+            if self._mode == "traj":
+                if self._head is None:
+                    return False, "head_missing"
+                if not self._head_loaded and not allow_untrained:
+                    return False, "head_not_loaded_set_METAMON_WINPROB_CKPT_or_allow_untrained"
+            else:
+                if self._tstep_agent is None:
+                    return False, "timestep_agent_missing"
             return True, "ok"
         except Exception as e:
             return False, f"exception:{e}"
+
+    # -------- Context presence helper --------
+    def has_context(self, battle) -> bool:
+        try:
+            return id(battle) in self._contexts
+        except Exception:
+            return False
 
     # -------- Context management --------
     def _infer_gen_from_btag(self, battle_tag: str) -> int:
@@ -340,6 +584,12 @@ class MetamonBridge:
             if ckey in self._contexts:
                 return
             parent = self._contexts[pkey]
+            # Pre-clone diag: length of parent's replay (turnlist)
+            try:
+                preplay = getattr(parent.mm_battle, "_mm_battle", None)
+                parent_turns = len(getattr(preplay, "turnlist", []) or [])
+            except Exception:
+                parent_turns = 0
             gen = self._infer_gen_from_btag(
                 getattr(child_battle, "battle_tag", getattr(parent.mm_battle, "battle_tag", "battle-gen9ou"))
             )
@@ -361,12 +611,67 @@ class MetamonBridge:
                     # Fallback to older nested path if present
                     from metamon.metamon.backend.replay_parser import forward as _forward  # type: ignore
                 child_mm._sim_protocol = _forward.SimProtocol(child_mm._mm_battle)
+                # Propagate player role explicitly to the child backend
+                try:
+                    parent_role = getattr(parent.mm_battle, "player_role", None)
+                    if parent_role in ("p1", "p2"):
+                        setattr(child_mm, "player_role", parent_role)
+                except Exception:
+                    pass
+                # Best-effort backfill of current-turn active HP from parent into child
+                try:
+                    p_replay = getattr(parent.mm_battle, "_mm_battle", None)
+                    c_replay = getattr(child_mm, "_mm_battle", None)
+                    if (
+                        p_replay is not None
+                        and c_replay is not None
+                        and getattr(p_replay, "turnlist", None)
+                        and getattr(c_replay, "turnlist", None)
+                    ):
+                        p_turn = p_replay.turnlist[-1]
+                        c_turn = c_replay.turnlist[-1]
+                        # helper: copy hp if known
+                        def _copy_hp(src_mon, dst_mon):
+                            try:
+                                if src_mon is None or dst_mon is None:
+                                    return
+                                chp = getattr(src_mon, "current_hp", None)
+                                mhp = getattr(src_mon, "max_hp", None)
+                                if chp is not None:
+                                    setattr(dst_mon, "current_hp", chp)
+                                if mhp is not None:
+                                    setattr(dst_mon, "max_hp", mhp)
+                            except Exception:
+                                pass
+                        # Both sides actives
+                        try:
+                            p1_src = p_turn.get_active_pokemon(True)[0]
+                            p2_src = p_turn.get_active_pokemon(False)[0]
+                        except Exception:
+                            p1_src = None
+                            p2_src = None
+                        try:
+                            p1_dst = c_turn.get_active_pokemon(True)[0]
+                            p2_dst = c_turn.get_active_pokemon(False)[0]
+                        except Exception:
+                            p1_dst = None
+                            p2_dst = None
+                        _copy_hp(p1_src, p1_dst)
+                        _copy_hp(p2_src, p2_dst)
+                except Exception as e:
+                    self._dbg(f"clone_context hp backfill failed: {e}")
             except Exception as e:
                 self._dbg(f"clone_context deep copy failed: {e}")
 
             hidden = self._clone_hidden(parent.hidden) if torch is not None else None
             ctx = _Ctx(mm_battle=child_mm, hidden=hidden, time_idx=parent.time_idx, ephemeral=True)
-            ctx.player_role = getattr(parent, "player_role", None)
+            try:
+                # Cache role on context as well
+                ctx.player_role = getattr(parent, "player_role", None)
+                if ctx.player_role is None:
+                    ctx.player_role = getattr(parent.mm_battle, "player_role", None)
+            except Exception:
+                pass
             self._contexts[ckey] = ctx
             # Clone normalizer state so LocalSim branches inherit roster info
             try:
@@ -376,19 +681,70 @@ class MetamonBridge:
             # Debug: log clone mapping and parent replay size
             try:
                 if self._debug or str(os.getenv("POKECHAMP_MINIMAX_LOG", "0")).lower() in {"1","true","t","yes","y"}:
-                    turns = 0
-                    try:
-                        preplay = getattr(parent.mm_battle, "_mm_battle", None)
-                        if preplay is not None and getattr(preplay, "turnlist", None):
-                            turns = len(preplay.turnlist)
-                    except Exception:
-                        pass
-                    print(
-                        f"[MetamonBridge] clone_context parent_id={id(parent_battle)} -> child_id={id(child_battle)} turns={turns}",
-                        flush=True,
-                    )
+                    print(f"[MetamonBridge] clone_context parent_id={id(parent_battle)} -> child_id={id(child_battle)} turns={parent_turns}", flush=True)
             except Exception:
                 pass
+
+    def sync_context(self, dst_battle, src_battle) -> None:
+        """Refresh an existing destination context from a source (live) context.
+
+        Copies the parsed replay and resets the sim protocol. Propagates player_role
+        and aligns hidden/time_idx for trajectory continuity.
+        """
+        with self._lock:
+            dkey = id(dst_battle)
+            skey = id(src_battle)
+            if skey not in self._contexts:
+                # Ensure live context exists
+                try:
+                    self.ensure_registered(src_battle)
+                except Exception as e:
+                    self._dbg(f"sync_context ensure live failed: {e}")
+                    return
+            if dkey not in self._contexts:
+                return
+            dctx = self._contexts[dkey]
+            sctx = self._contexts[skey]
+            try:
+                # Replace parsed replay
+                dctx.mm_battle._mm_battle = copy.deepcopy(sctx.mm_battle._mm_battle)
+                # Reset protocol on destination
+                try:
+                    from metamon.backend.replay_parser import forward as _forward  # type: ignore
+                except Exception:
+                    from metamon.metamon.backend.replay_parser import forward as _forward  # type: ignore
+                dctx.mm_battle._sim_protocol = _forward.SimProtocol(dctx.mm_battle._mm_battle)
+                # Role propagation
+                try:
+                    role = getattr(sctx.mm_battle, "player_role", None)
+                    if role in ("p1", "p2"):
+                        setattr(dctx.mm_battle, "player_role", role)
+                        dctx.player_role = role
+                except Exception:
+                    pass
+                # Align hidden state and time index
+                try:
+                    if torch is not None:
+                        dctx.hidden = self._clone_hidden(sctx.hidden)
+                    dctx.time_idx = sctx.time_idx
+                except Exception:
+                    pass
+                # Optional debug: report refresh
+                try:
+                    if self._debug or str(os.getenv("POKECHAMP_MINIMAX_LOG", "0")).lower() in {"1","true","t","yes","y"}:
+                        turns = 0
+                        try:
+                            turns = len(getattr(dctx.mm_battle._mm_battle, "turnlist", []) or [])
+                        except Exception:
+                            turns = 0
+                        print(
+                            f"[MetamonBridge] sync_context src_id={id(src_battle)} -> dst_id={id(dst_battle)} turns={turns}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+            except Exception as e:
+                self._dbg(f"sync_context failed: {e}")
 
     def _clone_hidden(self, hidden):
         if hidden is None:
@@ -513,6 +869,8 @@ class MetamonBridge:
             except Exception:
                 expected_n = None
 
+        # Removed noisy per-leaf logging of obs keys/shapes to keep output concise
+
         for k, v in obs_np.items():
             if k == "numbers" and expected_n is not None:
                 try:
@@ -591,22 +949,54 @@ class MetamonBridge:
             try:
                 if torch is not None and not ctx.ephemeral:
                     self._advance_hidden(ctx)
+                    # Instrumentation (periodic health logging) removed
             except Exception as e:
                 self._dbg_exc("advance_hidden on_request error", e)
 
     # -------- Scoring --------
-    def score(self, battle) -> Optional[int]:
-        """Return score in [0, 100] for the given battle branch.
+    def score(self, battle) -> Optional[float]:
+        """Return float score in [0, 100] for the given battle branch.
 
-        Uses the branch context’s hidden state as live history; applies a single
-        observation step for the current snapshot; does not mutate hidden state.
+        In 'traj' mode: uses mirrored trajectory context + trajectory encoder.
+        In 'timestep' mode: computes from the current Battle snapshot only.
         """
+        self._ensure_model()
+        if torch is None:
+            return None
+        if getattr(self, "_mode", "timestep") == "timestep":
+            # Build obs from live Battle directly (no replay, no context)
+            try:
+                ustate = UniversalState.from_Battle(battle)
+            except Exception as e:
+                self._dbg_exc("timestep build ustate", e)
+                try:
+                    snap = self._battle_snapshot(battle)
+                    self._dbg(f"battle snapshot: {json.dumps(snap, default=str)}")
+                except Exception:
+                    pass
+                self._dump_tstep_fail("ustate", battle, None, e)
+                return None
+            try:
+                obs_np = self._obs_space(ustate)
+            except Exception as e:
+                self._dbg_exc("timestep obs_space encode", e)
+                try:
+                    self._log_observation_debug(ustate)
+                except Exception:
+                    pass
+                self._dump_tstep_fail("obs_space", battle, ustate, e)
+                return None
+            obs = self._to_torch_batch(obs_np, device=self._device)
+            rl2s = torch.zeros((1, 1, int(self._rl2_width)), dtype=torch.float32, device=self._device)
+            with torch.no_grad():
+                logits = self._tstep_agent.compute_from_obs(obs=obs, rl2s=rl2s)  # [1,1]
+                prob = torch.sigmoid(logits).item()
+            return float(np.clip(prob, 0.0, 1.0) * 100.0)
+
+        # Trajectory-based scoring requires a context
         key = id(battle)
         ctx = self._contexts.get(key)
         if ctx is None:
-            return None
-        self._ensure_model()
-        if torch is None:
             return None
         # Build current obs (prefer replay; fall back to battle)
         obs_np = self._build_obs_np(ctx)
@@ -661,7 +1051,10 @@ class MetamonBridge:
                     print(f"[MetamonBridge] score dbg: ctx={id(battle)} prob={prob:.4f}", flush=True)
             except Exception:
                 pass
-        score = int(round(max(0.0, min(1.0, prob)) * 100.0))
+        # Stats + occasional health snapshot
+        # Instrumentation and periodic health logging removed
+        # Return a float percentage without rounding to preserve sensitivity
+        score = float(np.clip(prob, 0.0, 1.0) * 100.0)
         return score
 
     # -------- Observation builder (ReplayState) --------
@@ -781,3 +1174,6 @@ def enable(model_name: Optional[str] = None, *, strict: bool = False):
         ready, reason = METAMON_BRIDGE.is_ready()
         if not ready:
             raise RuntimeError(f"Metamon bridge not ready: {reason}")
+
+def get_mode() -> str:
+    return METAMON_BRIDGE._mode

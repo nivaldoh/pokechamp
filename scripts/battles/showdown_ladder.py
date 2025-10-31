@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--temperature", type=float, default=0.5)
 parser.add_argument("--prompt_algo", default="minimax", choices=prompt_algos)
 parser.add_argument("--battle_format", default="gen9ou", choices=["gen8randombattle", "gen8ou", "gen9ou", "gen9randombattle"])
-parser.add_argument("--main_backend", type=str, default="gemini-2.5-pro", choices=[
+parser.add_argument("--primary_model", type=str, default="gpt-5-mini", choices=[
     # OpenAI models
     "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
     # Anthropic Claude models (direct via Anthropic API)
@@ -41,7 +41,7 @@ parser.add_argument("--main_backend", type=str, default="gemini-2.5-pro", choice
     # Local models (via OpenRouter)
     "llama", 'None'
 ])
-parser.add_argument("--assistant_backend", type=str, default="gemini-2.5-flash", choices=[
+parser.add_argument("--secondary_model", type=str, default="gemini-2.5-flash", choices=[
     # Google models
     "google/gemini-pro", "gemini-2.0-flash", "gemini-2.0-pro", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
     # Fallbacks (if someone wants assistants on other providers via OpenRouter)
@@ -59,7 +59,7 @@ args = parser.parse_args()
     
 async def main():
     player = get_llm_player(args, 
-                            args.main_backend, 
+                            args.primary_model, 
                             args.prompt_algo, 
                             args.name, 
                             device=args.device,
@@ -67,7 +67,8 @@ async def main():
                             online=True, 
                             USERNAME=args.USERNAME, 
                             PASSWORD=args.PASSWORD,
-                            assistant_backend=args.assistant_backend)
+                            primary_model=args.primary_model,
+                            secondary_model=args.secondary_model)
     
     if args.team_dir:
         teamloader = TeamSet(args.team_dir, args.battle_format)

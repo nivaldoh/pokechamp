@@ -26,7 +26,7 @@ parser.add_argument(
     default=argparse.SUPPRESS,
     help="Alias for --player_prompt_algo",
 )
-parser.add_argument("--player_backend", type=str, default="gemini-2.0-flash", choices=[
+parser.add_argument("--player_backend", type=str, default="gpt-5-mini", choices=[
     # OpenAI models
     "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o", "gpt-4o-2024-05-13", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
     # Anthropic Claude models (direct via Anthropic API)
@@ -54,6 +54,8 @@ parser.add_argument("--player_backend", type=str, default="gemini-2.0-flash", ch
 ])
 parser.add_argument("--player_name", type=str, default='pokechamp', choices=bot_choices)
 parser.add_argument("--player_device", type=int, default=0)
+parser.add_argument("--primary_model", type=str, default=None, help="Primary model for root LLM calls")
+parser.add_argument("--secondary_model", type=str, default=None, help="Secondary model for non-root LLM calls")
 
 # Opponent arguments
 parser.add_argument("--opponent_prompt_algo", default="io", choices=prompt_algos)
@@ -130,7 +132,9 @@ async def main():
                             args.player_name, 
                             device=args.player_device,
                             PNUMBER1=PNUMBER1,  # for name uniqueness locally
-                            battle_format=args.battle_format)
+                            battle_format=args.battle_format,
+                            primary_model=(args.primary_model or args.player_backend),
+                            secondary_model=(args.secondary_model or args.player_backend))
     
     opponent = get_llm_player(args, 
                             args.opponent_backend, 
@@ -138,7 +142,9 @@ async def main():
                             args.opponent_name, 
                             device=args.opponent_device,
                             PNUMBER1=PNUMBER1 + '2',  # for name uniqueness locally
-                            battle_format=args.battle_format)
+                            battle_format=args.battle_format,
+                            primary_model=(args.primary_model or args.opponent_backend),
+                            secondary_model=(args.secondary_model or args.opponent_backend))
 
     # Use old teamloader for player, modern for opponent
     player_teamloader = get_metamon_teams(args.battle_format, "competitive")

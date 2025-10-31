@@ -1576,11 +1576,7 @@ def state_translate2(sim: LocalSim,
     if battle.active_pokemon.fainted: # passive switching
 
         system_prompt = (
-            f"You are a pokemon battler in generation {sim.gen.gen} OU format Pokemon Showdown that targets to win the pokemon battle. Your {battle.active_pokemon.species} just fainted. Choose a suitable pokemon to continue the battle. Here are some tips:"
-            " Compare the speeds of your pokemon to the opposing pokemon, which determines who take the move first."
-            " Consider the defense state and type-resistance of your pokemon when its speed is lower than the opposing pokemon."
-            " Consider the move-type advantage of your pokemon pokemon when its speed is higher than the opposing pokemon."
-            f" Player elo is {player_elo}. Player is P2. Opponent elo is {opponent_elo}. Opponent is P1.\n"
+            f"You are a high-level competitive Pokémon player in gen {sim.gen.gen} OU, making a decision during a battle."
             )
 
         state_prompt = battle_prompt + opponent_prompt + switch_prompt
@@ -1589,13 +1585,7 @@ def state_translate2(sim: LocalSim,
     else: # take a move or active switch
 
         system_prompt = (
-            f"You are a pokemon battler in generation {sim.gen.gen} OU format Pokemon Showdown that targets to win the pokemon battle. You can choose to take a move or switch in another pokemon. Here are some battle tips:"
-            " Use status-boosting moves like swordsdance, calmmind, dragondance, nastyplot strategically. The boosting will be reset when pokemon switch out."
-            " Set traps like stickyweb, spikes, toxicspikes, stealthrock strategically."
-            " When face to a opponent is boosting or has already boosted its attack/special attack/speed, knock it out as soon as possible, even sacrificing your pokemon."
-            " if choose to switch, you forfeit to take a move this turn and the opposing pokemon will definitely move first. Therefore, you should pay attention to speed, type-resistance and defense of your switch-in pokemon to bear the damage from the opposing pokemon."
-            " And If the switch-in pokemon has a slower speed then the opposing pokemon, the opposing pokemon will move twice continuously."
-            f" Player elo is {player_elo}. Player is P2. Opponent elo is {opponent_elo}. Opponent is P1.\n"
+            f"You are a high-level competitive Pokémon player in gen {sim.gen.gen} OU, making a decision during a battle."
             )
 
         system_prompt = system_prompt + sim.strategy

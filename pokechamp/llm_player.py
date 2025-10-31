@@ -1,5 +1,6 @@
 import ast
 from copy import copy, deepcopy
+from concurrent.futures import ThreadPoolExecutor, Future
 import datetime
 import json
 import logging
@@ -64,8 +65,8 @@ class LLMPlayer(Player):
                  prompt_translate: Callable=state_translate,
                  device=0,
                  llm_backend=None,
-                 main_backend: Optional[str] = None,
-                 assistant_backend: Optional[str] = None,
+                 primary_model: Optional[str] = None,
+                 secondary_model: Optional[str] = None,
                  log_level: int = logging.WARNING,
                  use_metamon_value_function: Optional[bool] = True,
                  ):
@@ -113,6 +114,11 @@ class LLMPlayer(Player):
         self._recent_deltas: List[Tuple[float, float]] = []  # (dealt, taken)
         self._last_turn_snapshot: Optional[Dict[str, float]] = None
 
+        # Background team strategy (per-battle) state
+        self._bg_strategy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=2)
+        self._bg_strategy_future_by_tag: Dict[str, Future] = {}
+        self._bg_strategy_text_by_tag: Dict[str, str] = {}
+
         if llm_backend is None:
             print(f"Initializing backend: {backend}")  # Debug logging
             if backend.startswith('ollama/'):
@@ -134,12 +140,11 @@ class LLMPlayer(Player):
         else:
             self.llm = llm_backend
         self.llm_value = self.llm
-
-        # Allow separate models for assistants and main decider (MCP pipeline)
-        self.main_backend = main_backend if main_backend is not None else backend
-        self.assistant_backend = assistant_backend if assistant_backend is not None else backend
+        # Primary/secondary model routing
+        self.primary_model = primary_model if primary_model is not None else backend
+        self.secondary_model = secondary_model if secondary_model is not None else self.primary_model
         self.K = K      # for minimax, SC, ToT
-        self.use_optimized_minimax = True  # Enable optimized minimax by default
+        self.use_optimized_minimax = False
         self._minimax_initialized = False
         # Configuration for time optimization
         self.use_damage_calc_early_exit = True  # Use damage calculator to exit early when advantageous
@@ -191,9 +196,9 @@ class LLMPlayer(Player):
 
     def get_LLM_action(self, system_prompt, user_prompt, model, temperature=0.7, json_format=False, seed=None, stop=[], max_tokens=200, actions=None, llm=None) -> str:
         if llm is None:
-            output, _ = self.llm.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
+            output, _ = self.llm.get_LLM_action(system_prompt, user_prompt, model, temperature, json_format, seed, stop, max_tokens=max_tokens, actions=actions)
         else:
-            output, _ = llm.get_LLM_action(system_prompt, user_prompt, model, temperature, True, seed, stop, max_tokens=max_tokens, actions=actions)
+            output, _ = llm.get_LLM_action(system_prompt, user_prompt, model, temperature, json_format, seed, stop, max_tokens=max_tokens, actions=actions)
         return output
 
     @staticmethod
@@ -290,6 +295,15 @@ class LLMPlayer(Player):
         return pokemon
 
     def choose_move(self, battle: AbstractBattle):
+        # Kick off / poll background strategy loop and adopt latest text
+        try:
+            self._maybe_start_bg(battle)
+            self._maybe_poll_bg(battle)
+            # Expose the latest strategy text for downstream prompts
+            self.strategy_prompt = self._get_bg_strategy_text(battle)
+        except Exception:
+            pass
+
         sim = LocalSim(battle, 
                     self.move_effect,
                     self.pokemon_move_dict,
@@ -382,7 +396,7 @@ class LLMPlayer(Player):
                                                user_prompt=state_prompt_tot_2.replace("[OPTIONS]", llm_output1),
                                                model=self.backend,
                                                temperature=self.temperature,
-                                               max_tokens=100,
+                                               max_tokens=10000,
                                                json_format=True)
 
                     next_action = self.parse_new(llm_output2, battle, sim)
@@ -450,6 +464,9 @@ class LLMPlayer(Player):
                     choose_max_damage_move=self.choose_max_damage_move,
                     build_local_sim=build_local_sim,
                     llm_value=self.llm_value,
+                    get_strategy_text=lambda b: self._get_bg_strategy_text(b),
+                    root_model=self.primary_model,
+                    child_model=self.secondary_model,
                 )
 
                 # Delegate to strategy
@@ -460,7 +477,7 @@ class LLMPlayer(Player):
                 return self.choose_max_damage_move(battle)
 
         
-    def io(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None):
+    def io(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle: Battle, sim, dont_verify=False, actions=None, model: Optional[str] = None):
         next_action = None
         cot_prompt = 'In fewer than 3 sentences, let\'s think step by step:'
         state_prompt_io = state_prompt + state_action_prompt + constraint_prompt_io + cot_prompt
@@ -469,9 +486,9 @@ class LLMPlayer(Player):
             try:
                 llm_output = self.get_LLM_action(system_prompt=system_prompt,
                                             user_prompt=state_prompt_io,
-                                            model=self.backend,
+                                            model=(model or self.backend),
                                             temperature=self.temperature,
-                                            max_tokens=300,
+                                            max_tokens=2000,
                                             # stop=["reason"],
                                             json_format=True,
                                             actions=actions)
@@ -567,6 +584,213 @@ class LLMPlayer(Player):
             # raise ValueError('No valid move', battle.active_pokemon.fainted, len(battle.available_switches))
             next_action = self.choose_max_damage_move(battle)
         return next_action
+
+    # -------------------- Background team strategy helpers --------------------
+    def _build_strategy_snapshot(self, battle: Battle) -> str:
+        """Build a compact snapshot of both teams and current state for the strategy LLM.
+
+        Includes:
+        - Our team: species, revealed item, ability, up to 4 known moves
+        - Opponent (revealed/preview): species, revealed item/ability, known moves
+        - Active mons, HP/status, simple hazards
+        - Tera availability for both sides
+        """
+        try:
+            # Our team
+            our_entries = []
+            for mon in battle.team.values():
+                try:
+                    moves = list(mon.moves.keys())[:4]
+                except Exception:
+                    moves = []
+                our_entries.append(
+                    {
+                        "species": getattr(mon, "species", None),
+                        "item": getattr(mon, "item", None),
+                        "ability": getattr(mon, "ability", None),
+                        "moves": moves,
+                    }
+                )
+
+            # Opponent entries (revealed or preview)
+            opp_entries = []
+            try:
+                # Prefer opponent_team values (revealed)
+                for mon in battle.opponent_team.values():
+                    try:
+                        moves = list(mon.moves.keys())[:4]
+                    except Exception:
+                        moves = []
+                    opp_entries.append(
+                        {
+                            "species": getattr(mon, "species", None),
+                            "item": getattr(mon, "item", None),
+                            "ability": getattr(mon, "ability", None),
+                            "moves": moves,
+                        }
+                    )
+            except Exception:
+                pass
+
+            # If we have a team preview list exposed via opponent_team during preview,
+            # the above will already include them. Otherwise, attempt a safe preview fetch.
+            # (We avoid relying on non-public attrs.)
+
+            # Active state
+            def _mk_active(mon):
+                if mon is None:
+                    return None
+                return {
+                    "species": getattr(mon, "species", None),
+                    "hp": getattr(mon, "current_hp", None),
+                    "max_hp": getattr(mon, "max_hp", None),
+                    "status": getattr(mon, "status", None).name if getattr(mon, "status", None) is not None else None,
+                }
+
+            active_our = _mk_active(getattr(battle, "active_pokemon", None))
+            active_opp = _mk_active(getattr(battle, "opponent_active_pokemon", None))
+
+            # Hazards (simple string keys)
+            def _side_to_names(side):
+                try:
+                    return [getattr(k, "name", str(k)).lower() for k in side.keys()]
+                except Exception:
+                    return []
+
+            hazards_our = _side_to_names(getattr(battle, "side_conditions", {}))
+            hazards_opp = _side_to_names(getattr(battle, "opponent_side_conditions", {}))
+
+            # Tera flags
+            our_can_tera = getattr(battle, "can_tera", None) is not None
+            opp_can_tera = False
+            for name in ("opponent_can_terrastallize", "_opponent_can_terrastallize"):
+                val = getattr(battle, name, None)
+                if isinstance(val, bool):
+                    opp_can_tera = val
+                    break
+
+            snap = {
+                "turn": getattr(battle, "turn", None),
+                "our_team": our_entries,
+                "opp_team": opp_entries,
+                "active": {"our": active_our, "opp": active_opp},
+                "hazards": {"our": hazards_our, "opp": hazards_opp},
+                "tera": {"our_can_tera": our_can_tera, "opp_can_tera": opp_can_tera},
+            }
+            return json.dumps(snap, ensure_ascii=False)
+        except Exception:
+            # Fallback: minimal string
+            return "{}"
+
+    def _submit_bg_strategy(self, battle: Battle) -> Future:
+        """Submit a background LLM call to build/update the strategy text for this battle."""
+        system_prompt = """
+        SYSTEM
+You are a Gen 9 OU battle assistant. Given a minimal snapshot, output a terse, actionable high-level gameplan that keeps long-term win conditions in mind. 
+- Infer roles/sets only from revealed info. If unknown, write "unknown".
+- Assume the opponent may still Terastallize unless explicitly stated otherwise; plan safe lines that hold vs common Tera types.
+- Prioritize: 1) preserve/enable our win condition(s); 2) neutralize immediate threats; 3) hazards plan (set/clear/ignore); 4) momentum via pivots/safe sacks.
+- Do NOT try to do math.
+- Be concise and structured. No prose explanations, no move calcs, no speculation beyond revealed info.
+- Hard cap: ≤ 900 characters total.
+
+OUTPUT (strict JSON; one-liners, no extra text)
+{
+  "summary": "<1 sentence on board & immediate pressure>",
+  "wincons": ["<primary plan>", "<backup plan>"],
+  "threats": ["<top 1-3 threats by name/why in 3-5 words>"],
+  "hazards_plan": "<set | clear | ignore + 3-5 words>",
+  "pivot_plan": "<safe pivot or stay; how to gain tempo>",
+  "tera_plan": {
+    "use_now": "<yes|no|maybe>",
+    "ours": "<who/type and why in ≤8 words>",
+    "opp_checks": ["<if they Tera X, do Y>", "..."]
+  },
+  "status_effects": {
+    "ours": "<1-3 status effects we can apply on ourselves or opponents>"
+    "theirs": "<1-3 status effects the opponent can apply on themselves or opponents>"
+  }
+  "sack_order": ["<optional, 1-2 expendable mons or 'none'>"]
+}
+
+        """
+        user_prompt = self._build_strategy_snapshot(battle)
+
+        def _job():
+            try:
+                try:
+                    print(f"[Strategy BG START] battle={getattr(battle, 'battle_tag', '?')} turn={getattr(battle, 'turn', '?')}", flush=True)
+                except Exception:
+                    pass
+                t0 = time.time()
+                out = self.get_LLM_action(system_prompt=system_prompt,
+                                          user_prompt=user_prompt,
+                                          model=(self.primary_model if hasattr(self, 'primary_model') else self.backend),
+                                          temperature=self.temperature,
+                                          max_tokens=300)
+                dt = time.time() - t0
+                try:
+                    print(f"[Strategy BG DONE] battle={getattr(battle, 'battle_tag', '?')} (+{dt:.2f}s) len={len(out) if isinstance(out, str) else 0}", flush=True)
+                except Exception:
+                    pass
+                return out if isinstance(out, str) else ""
+            except Exception as e:
+                try:
+                    print(f"[Strategy BG ERROR] battle={getattr(battle, 'battle_tag', '?')} err={e}", flush=True)
+                except Exception:
+                    pass
+                return ""
+
+        return self._bg_strategy_executor.submit(_job)
+
+    def _has_sufficient_team_info(self, battle: Battle) -> bool:
+        try:
+            our_ok = len(getattr(battle, "team", {}) or {}) >= 1
+            # Opponent preview or at least revealed active/opponent_team
+            opp_ok = False
+            # Use opponent_team values if available
+            opp_ok = opp_ok or (len(getattr(battle, "opponent_team", {}) or {}) >= 1)
+            # Active opponent mon known
+            opp_ok = opp_ok or (getattr(battle, "opponent_active_pokemon", None) is not None)
+            return bool(our_ok and opp_ok)
+        except Exception:
+            return False
+
+    def _maybe_start_bg(self, battle: Battle) -> None:
+        tag = getattr(battle, "battle_tag", None)
+        if tag is None:
+            return
+        if tag in self._bg_strategy_future_by_tag:
+            return
+        if not self._has_sufficient_team_info(battle):
+            return
+        fut = self._submit_bg_strategy(battle)
+        self._bg_strategy_future_by_tag[tag] = fut
+
+    def _maybe_poll_bg(self, battle: Battle) -> None:
+        tag = getattr(battle, "battle_tag", None)
+        if tag is None:
+            return
+        fut = self._bg_strategy_future_by_tag.get(tag)
+        if fut is None:
+            return
+        if not fut.done():
+            return
+        # Adopt result
+        try:
+            out = fut.result()
+            if isinstance(out, str) and out.strip():
+                self._bg_strategy_text_by_tag[tag] = out.strip()
+        except Exception:
+            pass
+        # Submit next job immediately
+        self._bg_strategy_future_by_tag[tag] = self._submit_bg_strategy(battle)
+
+    def _get_bg_strategy_text(self, battle: Battle) -> str:
+        tag = getattr(battle, "battle_tag", None)
+        if tag is None:
+            return ""
+        return self._bg_strategy_text_by_tag.get(tag, "")
 
     def sc(self, retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim):
         actions = [self.io(retries, system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, battle, sim) for i in range(self.K)]

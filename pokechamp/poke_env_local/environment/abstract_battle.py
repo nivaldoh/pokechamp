@@ -1,7 +1,7 @@
 import os
 from abc import ABC, abstractmethod
 from logging import Logger
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
 
 from pokechamp.poke_env_local.data import GenData, to_id_str
 from pokechamp.poke_env_local.data.replay_template import REPLAY_TEMPLATE
@@ -176,6 +176,81 @@ class AbstractBattle(ABC):
         # Pokemon attributes
         self._team: Dict[str, Pokemon] = {}
         self._opponent_team: Dict[str, Pokemon] = {}
+
+    # -------------------- Debug helpers (opt-in) --------------------
+    def _pc__debug_on(self) -> bool:
+        try:
+            return str(os.getenv("POKECHAMP_METAMON_DEBUG", "")).lower() in {"1", "true", "t", "yes", "y"}
+        except Exception:
+            return False
+
+    def _pc__safe_name(self, mon: Optional[Pokemon]) -> str:
+        try:
+            return getattr(mon, "species", None) or "?"
+        except Exception:
+            return "?"
+
+    def _pc__safe_hp(self, mon: Optional[Pokemon]) -> str:
+        try:
+            chp = getattr(mon, "current_hp", None)
+            mhp = getattr(mon, "max_hp", None)
+            if chp is None or mhp is None:
+                return "?/ ?"
+            return f"{int(chp)}/{int(mhp)}"
+        except Exception:
+            return "?/ ?"
+
+    def _pc_dump_state(self, ctx: str, *, event: Optional[str] = None) -> None:
+        """Emit a concise snapshot of the local Battle state after parsing.
+
+        Enabled only when POKECHAMP_METAMON_DEBUG is set (shared with Metamon logs).
+        """
+        if not self._pc__debug_on():
+            return
+        try:
+            # Active mons (tolerant to early phases)
+            try:
+                act_p = self.active_pokemon
+            except Exception:
+                act_p = None
+            try:
+                act_o = self.opponent_active_pokemon
+            except Exception:
+                act_o = None
+
+            # Available moves/switches (tolerant to absence)
+            try:
+                moves = [getattr(m, "id", str(m)) for m in (self.available_moves or [])]
+            except Exception:
+                moves = []
+            try:
+                switches = [f"{self._pc__safe_name(p)}({self._pc__safe_hp(p)})" for p in (self.available_switches or [])]
+            except Exception:
+                switches = []
+
+            # Capabilities/flags (tolerant to formats)
+            def _boolsafe(getter: Callable[[], Any]) -> Any:
+                try:
+                    return getter()
+                except Exception:
+                    return None
+
+            evt = f" event={event}" if event else ""
+            print(
+                (
+                    f"[PokechampBattle] {ctx}{evt} tag={self.battle_tag} turn={getattr(self,'_turn',None)} role={self.player_role} "
+                    f"wait={getattr(self,'_wait',None)} forceSwitch={_boolsafe(lambda: self.force_switch)} "
+                    f"maybeTrapped={_boolsafe(lambda: self.maybe_trapped)} trapped={getattr(self,'_trapped',None)} teampreview={self._teampreview} "
+                    f"canMega={_boolsafe(lambda: self.can_mega_evolve)} canZ={_boolsafe(lambda: self.can_z_move)} canDmax={_boolsafe(lambda: self.can_dynamax)} canTera={bool(_boolsafe(lambda: self.can_tera))}\n"
+                    f"  active_p={self._pc__safe_name(act_p)} hp={self._pc__safe_hp(act_p)} | active_o={self._pc__safe_name(act_o)} hp={self._pc__safe_hp(act_o)}\n"
+                    f"  moves={moves}\n"
+                    f"  switches={switches}"
+                ),
+                flush=True,
+            )
+        except Exception:
+            # Do not allow debug printing to interfere with runtime
+            pass
 
     @classmethod
     def get_pokemon_predictor(cls):
