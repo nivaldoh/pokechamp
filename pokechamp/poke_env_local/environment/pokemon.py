@@ -126,6 +126,71 @@ class Pokemon:
             self._update_from_pokedex(species)
             
         
+    def __deepcopy__(self, memodict: Optional[Dict[int, Any]] = None):
+        """Custom deepcopy for fast battle branching.
+
+        This avoids copying large static structures (e.g., GenData and per-Pokemon
+        `_sets`) and creates independent copies only for mutable per-battle fields.
+        """
+        if memodict is None:
+            memodict = {}
+        cls = self.__class__
+        obj = cls.__new__(cls)  # bypass __init__ to avoid file loads
+        memodict[id(self)] = obj
+
+        # Share read-only/static data
+        object.__setattr__(obj, "_data", self._data)  # GenData has custom deepcopy
+        object.__setattr__(obj, "_sets", self._sets)  # share heavy static team sets
+
+        # Species/typing/identity
+        object.__setattr__(obj, "_species", self._species)
+        object.__setattr__(obj, "_base_stats", self._base_stats)
+        object.__setattr__(obj, "_type_1", self._type_1)
+        object.__setattr__(obj, "_type_2", self._type_2)
+        object.__setattr__(obj, "_weightkg", self._weightkg)
+
+        # Individual attributes
+        object.__setattr__(obj, "_ability", self._ability)
+        object.__setattr__(obj, "_active", self._active)
+        object.__setattr__(obj, "_gender", self._gender)
+        object.__setattr__(obj, "_level", self._level)
+        object.__setattr__(obj, "_max_hp", self._max_hp)
+        object.__setattr__(obj, "_shiny", self._shiny)
+
+        # Battle-related mutable fields
+        object.__setattr__(obj, "_boosts", self._boosts.copy())
+        object.__setattr__(obj, "_current_hp", self._current_hp)
+        object.__setattr__(obj, "_effects", self._effects.copy())
+        object.__setattr__(obj, "_first_turn", self._first_turn)
+        object.__setattr__(obj, "_terastallized", self._terastallized)
+        object.__setattr__(obj, "_terastallized_type", self._terastallized_type)
+        object.__setattr__(obj, "_item", self._item)
+        # Shallow copy of last request/details — sufficient for branching
+        try:
+            lr = None if self._last_request is None else self._last_request.copy()
+        except Exception:
+            lr = None
+        object.__setattr__(obj, "_last_request", lr)
+        object.__setattr__(obj, "_last_details", self._last_details)
+        object.__setattr__(obj, "_must_recharge", self._must_recharge)
+        # Preparing move/target: share references; attributes themselves are overwritten per child
+        object.__setattr__(obj, "_preparing_move", self._preparing_move)
+        object.__setattr__(obj, "_preparing_target", self._preparing_target)
+        object.__setattr__(obj, "_protect_counter", self._protect_counter)
+        object.__setattr__(obj, "_revealed", self._revealed)
+        object.__setattr__(obj, "_status", self._status)
+        object.__setattr__(obj, "_status_counter", self._status_counter)
+
+        # Moves: make a new dict but reuse Move instances (which have a lightweight deepcopy)
+        try:
+            new_moves: Dict[str, Move] = {}
+            for k, v in (self._moves or {}).items():
+                new_moves[k] = copy.deepcopy(v, memodict)
+        except Exception:
+            new_moves = dict(getattr(self, "_moves", {}) or {})
+        object.__setattr__(obj, "_moves", new_moves)
+
+        return obj
         
     def __repr__(self) -> str:
         return self.__str__()

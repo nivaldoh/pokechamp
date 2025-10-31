@@ -126,6 +126,40 @@ class Move:
         self._dynamaxed_move = None
         self._request_target = None
 
+    def __deepcopy__(self, memodict: Optional[Dict[int, Any]] = None):
+        """Custom deepcopy to avoid copying large static dictionaries.
+
+        A Move holds a reference to GenData.moves (a large dict). Deepcopying
+        the default way would recursively copy that structure for every move
+        instance, which is extremely expensive. For minimax branching clones,
+        we only need a logical copy of the Move with its lightweight fields
+        while sharing the immutable/static lookup tables.
+
+        This implementation creates a new Move-like object by copying the
+        lightweight attributes and reusing the shared `_moves_dict` reference.
+        """
+        if memodict is None:
+            memodict = {}
+
+        # Fast path: return self for EmptyMove is defined separately below.
+        cls = self.__class__
+        obj = cls.__new__(cls)  # bypass __init__
+        memodict[id(self)] = obj
+
+        # Copy lightweight/scalar attributes
+        object.__setattr__(obj, "_id", copy.deepcopy(self._id, memodict))
+        object.__setattr__(obj, "_base_power_override", self._base_power_override)
+        object.__setattr__(obj, "_gen", self._gen)
+        # Reuse the large static dict instead of copying
+        object.__setattr__(obj, "_moves_dict", self._moves_dict)
+        object.__setattr__(obj, "_current_pp", self._current_pp)
+        object.__setattr__(obj, "_is_empty", self._is_empty)
+        # Dynamaxed move is another Move-like wrapper; keep None or shallow copy
+        dyn = getattr(self, "_dynamaxed_move", None)
+        object.__setattr__(obj, "_dynamaxed_move", None if dyn is None else copy.deepcopy(dyn, memodict))
+        object.__setattr__(obj, "_request_target", self._request_target)
+        return obj
+
     def __repr__(self) -> str:
         return f"{self._id} (Move object)"
 
