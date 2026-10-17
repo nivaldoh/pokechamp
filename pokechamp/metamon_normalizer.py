@@ -151,6 +151,35 @@ class SimProtocolNormalizer:
                     # If already spaced correctly keep it
                     if nm in mapping:
                         msg[3] = mapping[nm]
+
+                    # LocalSim sometimes emits a pseudo-move 'Terastallize'.
+                    # Metamon's replay parser expects a side effect line:
+                    #   ['','-terastallize', IDENT, TYPE]
+                    # Translate here by deriving the Tera type from the local battle state.
+                    if nm.lower() == 'terastallize':
+                        try:
+                            ident = str(msg[2]) if len(msg) > 2 else ''
+                            # Resolve the acting Pokemon from the local battle to read its (or guessed) Tera type
+                            p = battle.get_pokemon(ident) if hasattr(battle, 'get_pokemon') else None
+                            tera_type: str = ''
+                            if p is not None:
+                                # Prefer an already set terastallized type
+                                t = getattr(p, '_terastallized_type', None)
+                                if t is not None:
+                                    # PokemonType has a .name attribute (e.g., 'Bug', 'Fairy')
+                                    tera_type = getattr(t, 'name', '') or ''
+                                if not tera_type and hasattr(p, 'guess_tera'):
+                                    # Fall back to model-backed guess from local sets data
+                                    try:
+                                        tera_type = p.guess_tera() or ''
+                                    except Exception:
+                                        tera_type = ''
+                            # Only translate if we have a plausible type; otherwise keep the original move line
+                            if ident and tera_type:
+                                return ['', '-terastallize', ident, tera_type]
+                        except Exception:
+                            # If anything goes wrong, fall through and keep the original message
+                            pass
             except Exception:
                 pass
         return msg

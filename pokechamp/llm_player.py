@@ -68,7 +68,7 @@ class LLMPlayer(Player):
                  primary_model: Optional[str] = None,
                  secondary_model: Optional[str] = None,
                  log_level: int = logging.WARNING,
-                 use_metamon_value_function: Optional[bool] = True,
+                 use_metamon_value_function: Optional[bool] = None,
                  ):
 
         super().__init__(battle_format=battle_format,
@@ -181,8 +181,7 @@ class LLMPlayer(Player):
                     self.use_llm_value_function = False
                     cache_dir = os.getenv("METAMON_CACHE_DIR")
                     model = os.getenv("POKECHAMP_METAMON_MODEL", "Abra")
-                    head = "loaded" if getattr(_mb.METAMON_BRIDGE, "_head_loaded", False) else "untrained"
-                    print(f"[MetamonBridge] enabled model={model} head={head} cache={cache_dir}")
+                    print(f"[MetamonBridge] enabled model={model} cache={cache_dir}")
             except Exception as _e:
                 # Required path: raise and stop early
                 print(f"[MetamonBridge] initialization error: {_e}")
@@ -295,14 +294,8 @@ class LLMPlayer(Player):
         return pokemon
 
     def choose_move(self, battle: AbstractBattle):
-        # Kick off / poll background strategy loop and adopt latest text
-        try:
-            self._maybe_start_bg(battle)
-            self._maybe_poll_bg(battle)
-            # Expose the latest strategy text for downstream prompts
-            self.strategy_prompt = self._get_bg_strategy_text(battle)
-        except Exception:
-            pass
+        # Layered root orchestration is enabled by default; disable background strategy
+        self.strategy_prompt = ""
 
         sim = LocalSim(battle, 
                     self.move_effect,
@@ -440,7 +433,7 @@ class LLMPlayer(Player):
                         prompt_translate=self.prompt_translate
                     )
 
-                # Instantiate strategy with dependencies
+                # Instantiate strategy with dependencies (layered root orchestration)
                 strategy = MinimaxStrategy(
                     move_effect=self.move_effect,
                     pokemon_move_dict=self.pokemon_move_dict,
@@ -464,9 +457,12 @@ class LLMPlayer(Player):
                     choose_max_damage_move=self.choose_max_damage_move,
                     build_local_sim=build_local_sim,
                     llm_value=self.llm_value,
-                    get_strategy_text=lambda b: self._get_bg_strategy_text(b),
+                    get_strategy_text=None,
                     root_model=self.primary_model,
                     child_model=self.secondary_model,
+                    layered_system_prompt=(
+                        "You are a high-level competitive Pokémon player in gen 9 OU, making a decision during a battle."
+                    ),
                 )
 
                 # Delegate to strategy
@@ -500,6 +496,14 @@ class LLMPlayer(Player):
                 if DEBUG:
                     print(f"Parsed JSON: {llm_action_json}")
                 next_action = None
+                # Optional decision confidence (1-100). Keep optional to avoid breaking callers.
+                conf_val = None
+                try:
+                    raw_conf = llm_action_json.get('decision_confidence', None)
+                    if raw_conf is not None:
+                        conf_val = int(max(1, min(100, float(raw_conf))))
+                except Exception:
+                    conf_val = None
 
                 dynamax = "dynamax" in llm_action_json.keys()
                 tera = "terastallize" in llm_action_json.keys()
@@ -525,6 +529,11 @@ class LLMPlayer(Player):
                         if move.id.lower().replace(' ', '') == llm_move_id.lower().replace(' ', ''):
                             #next_action = self.create_order(move, dynamax=sim._should_dynamax(battle), terastallize=sim._should_terastallize(battle))
                             next_action = self.create_order(move, dynamax=dynamax, terastallize=tera)
+                            if conf_val is not None:
+                                try:
+                                    setattr(next_action, 'decision_confidence', conf_val)
+                                except Exception:
+                                    pass
                             if DEBUG:
                                 print(f"Move match found: {move.id}")
                             break
@@ -533,6 +542,11 @@ class LLMPlayer(Player):
                         # unseen move so just check if it is in the action prompt
                         if llm_move_id.lower().replace(' ', '') in state_action_prompt:
                             next_action = self.create_order(Move(llm_move_id.lower().replace(' ', ''), self.gen.gen), dynamax=dynamax, terastallize=tera)
+                            if conf_val is not None:
+                                try:
+                                    setattr(next_action, 'decision_confidence', conf_val)
+                                except Exception:
+                                    pass
                     
                     if next_action is None and DEBUG:
                         print(f"No move match found for '{llm_move_id}'")
@@ -554,6 +568,11 @@ class LLMPlayer(Player):
                     for i, pokemon in enumerate(switch_list):
                         if pokemon.species.lower().replace(' ', '') == llm_switch_species.lower().replace(' ', ''):
                             next_action = self.create_order(pokemon)
+                            if conf_val is not None:
+                                try:
+                                    setattr(next_action, 'decision_confidence', conf_val)
+                                except Exception:
+                                    pass
                             if DEBUG:
                                 print(f"Switch match found: {pokemon.species}")
                             break

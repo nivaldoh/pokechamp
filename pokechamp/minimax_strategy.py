@@ -8,6 +8,7 @@ It uses tree search with opponent modeling to find optimal moves.
 import json
 import os
 import time
+from time import perf_counter
 from collections import OrderedDict
 from copy import copy, deepcopy
 from typing import Any, Callable, Optional, Tuple
@@ -73,6 +74,7 @@ class MinimaxStrategy(DecisionStrategy):
         get_strategy_text: Optional[Callable[[Battle], str]] = None,
         root_model: Optional[str] = None,
         child_model: Optional[str] = None,
+        layered_system_prompt: Optional[str] = None,
         # Defaults must come last to satisfy Python's signature rules
         use_metamon_value_function: bool = True,
     ):
@@ -132,6 +134,10 @@ class MinimaxStrategy(DecisionStrategy):
         self.get_strategy_text = get_strategy_text
         self.root_model = root_model or backend
         self.child_model = child_model or backend
+        # Separate system prompt for layered root orchestration
+        self.layered_system_prompt = layered_system_prompt or (
+            "You are a high-level competitive Pokémon player in gen 9 OU, making a decision during a battle."
+        )
 
         # Initialize LLM value cache
         self._llm_value_cache_limit = 512
@@ -149,6 +155,210 @@ class MinimaxStrategy(DecisionStrategy):
         """
         retries = 10
         return self.tree_search(retries, battle)
+
+    # -------------------- Layered LLM Orchestration (root) --------------------
+    class _LayerContext:
+        def __init__(self, *, battle: Battle, sim: LocalSim,
+                     system_prompt_layered: str,
+                     state_prompt_ours: str, state_action_prompt_ours: str, io_player: str,
+                     state_prompt_opp: str, state_action_prompt_opp: str, io_opp: str):
+            self.battle = battle
+            self.sim = sim
+            self.system_prompt_layered = system_prompt_layered
+            # Prompts per side
+            self.state_prompt_ours = state_prompt_ours
+            self.state_action_prompt_ours = state_action_prompt_ours
+            self.io_player = io_player
+            self.state_prompt_opp = state_prompt_opp
+            self.state_action_prompt_opp = state_action_prompt_opp
+            self.io_opp = io_opp
+            # Accumulated outputs
+            self.text_outputs: dict[str, str] = {}
+            self.player_actions: list[BattleOrder] = []
+            self.opponent_actions: list[BattleOrder] = []
+
+        def register_text(self, tag: str, text: str) -> None:
+            if not isinstance(text, str):
+                return
+            self.text_outputs[tag] = text.strip()
+
+        def select_text(self, tags: list[str]) -> str:
+            parts = []
+            for t in tags:
+                v = self.text_outputs.get(t, "")
+                if isinstance(v, str) and v.strip():
+                    parts.append(f"[{t}]\n{v}")
+            return "\n\n".join(parts)
+
+    class _LayerTask:
+        def __init__(self, key: str, is_opp: bool, instruction: str, input_tags: list[str], parse_mode: str = "text"):
+            self.key = key
+            self.is_opp = is_opp
+            self.instruction = instruction
+            self.input_tags = input_tags
+            self.parse_mode = parse_mode  # 'text' or 'action'
+
+    class _BaseLayer:
+        name = "Layer"
+        parse_actions = False
+        def build_tasks(self, ctx: "MinimaxStrategy._LayerContext") -> list["MinimaxStrategy._LayerTask"]:
+            return []
+
+    class _L1StrategyLayer(_BaseLayer):
+        name = "L1 Strategy"
+        parse_actions = False
+        def build_tasks(self, ctx):
+            return [
+                MinimaxStrategy._LayerTask("L1.plan_ours", False, "[STRATEGY] Summarize our overall gameplan and win conditions.", []),
+                MinimaxStrategy._LayerTask("L1.plan_opp", True, "[STRATEGY] Summarize opponent's likely gameplan and win conditions.", []),
+                MinimaxStrategy._LayerTask("L1.speed", False, "[ANALYSIS] Identify who is likely to move first: us or the opponent.", []),
+                MinimaxStrategy._LayerTask("L1.hazards_tera", False, "[STRATEGY] How should we handle hazards and Tera usage?", []),
+            ]
+
+    class _L2ThreatsLayer(_BaseLayer):
+        name = "L2 Threats/Greed"
+        parse_actions = False
+        def build_tasks(self, ctx):
+            return [
+                MinimaxStrategy._LayerTask("L2.threats_ours", False, "[ANALYSIS] Identify whether we are under immediate threat or not and what would be our best response", ["L1.plan_ours", "L1.hazards_tera", "L1.speed"]),
+                MinimaxStrategy._LayerTask("L2.longterm_ours", True, "[TACTICS] Identify whether our active Pokémon has a move/item that grants long-term advantage.", ["L1.plan_ours"]),
+                MinimaxStrategy._LayerTask("L2.threats_opp", True, "[ANALYSIS] Identify whether the opponent is under immediate threat or not and what would be their best response.", ["L1.plan_opp", "L1.hazards_tera", "L1.speed"]),
+                MinimaxStrategy._LayerTask("L2.longterm_opp", True, "[TACTICS] Identify whether the opponent's active Pokémon has a move/item that grants them long-term advantage.", ["L1.plan_opp"]),
+            ]
+
+    class _L3TacticsLayer(_BaseLayer):
+        name = "L3 Tactics"
+        parse_actions = False
+        def build_tasks(self, ctx):
+            return [
+                MinimaxStrategy._LayerTask("L3.obvious_choice_ours", False, "[TACTICS] Identify whether we are forced to respond to an immediate threat or if we are safe to make a greedier choice (preferable, if available)", ["L2.threats_ours", "L2.longterm_ours"]),
+                MinimaxStrategy._LayerTask("L3.obvious_choice_opp", False, "[TACTICS] Identify whether the opponent is forced to respond to an immediate threat or if they are safe to make a greedier choice (they would prefer it, if available)", ["L2.threats_ours", "L2.longterm_ours"]),
+            ]
+
+    class _L4ActionsLayer(_BaseLayer):
+        name = "L4 Actions"
+        parse_actions = True
+        def build_tasks(self, ctx):
+            return [
+                MinimaxStrategy._LayerTask("L4.action_best_now", False, "Given prior summaries, output our best immediate action (JSON).", ["L3.obvious_choice_ours", "L3.obvious_choice_opp"], parse_mode="action"),
+                MinimaxStrategy._LayerTask("L4.action_greedy", False, "Given prior summaries, output the best long-term action (JSON).", ["L1.plan_ours", "L3.obvious_choice_ours", "L3.obvious_choice_opp"], parse_mode="action"),
+                MinimaxStrategy._LayerTask("L4.best_counter", True, "Given prior summaries, assume the opponent will choose their best option this turn and output our best option now that we have anticipated it (JSON).", ["L3.obvious_choice_opp"], parse_mode="action"),
+            ]
+
+    def _run_llm_tasks(self, retries: int, ctx: "MinimaxStrategy._LayerContext", tasks: list["MinimaxStrategy._LayerTask"], parse_actions: bool):
+        # Execute a batch of tasks in parallel (primary model only)
+        from concurrent.futures import ThreadPoolExecutor
+        results = {}
+        def _trim(s: str) -> str:
+            try:
+                return (s or "").strip()
+            except Exception:
+                return ""
+        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as ex:
+            futs = {}
+            for t in tasks:
+                # Build user prompt per task
+                # Select side-specific battle state prompt
+                if not t.is_opp:
+                    state_prompt_layer = ctx.state_prompt_ours
+                else:
+                    state_prompt_layer = ctx.state_prompt_opp
+                print(f'state prompt: {state_prompt_layer}')
+                # Selectively include prior outputs
+                selected = ctx.select_text(t.input_tags)
+                # Instruction
+                instruction = t.instruction
+                if parse_actions:
+                    # Build state prompt with selected prior text; let io() attach action constraints
+                    state_prompt_full = state_prompt_layer + ("\n\n" + selected if selected else "") + "\n" + instruction
+                    # Use io() to produce BattleOrder objects (JSON parsing inside io)
+                    futs[t.key] = ex.submit(
+                        self.io,
+                        retries,
+                        ctx.system_prompt_layered,
+                        state_prompt_full,
+                        "",
+                        (ctx.io_opp if t.is_opp else ctx.io_player),
+                        (ctx.state_action_prompt_opp if t.is_opp else ctx.state_action_prompt_ours),
+                        ctx.battle,
+                        ctx.sim,
+                        (t.is_opp),
+                        None,
+                        self.root_model,
+                    )
+                else:
+                    # Analysis/text: plain free-form output
+                    user_prompt = state_prompt_layer + ("\n\n" + selected if selected else "") + "\n" + instruction
+                    futs[t.key] = ex.submit(
+                        self.get_llm_action,
+                        ctx.system_prompt_layered,
+                        user_prompt,
+                        self.root_model,
+                        self.temperature,
+                        False,
+                    )
+            for key, fut in futs.items():
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = None
+                results[key] = res
+        return results
+
+    def _run_llm_pipeline(self, retries: int, *, battle: Battle, sim: LocalSim,
+                           state_prompt: str, state_action_prompt: str, io_player: str,
+                           state_prompt_o: str, state_action_prompt_o: str, io_opp: str):
+        # Create context
+        ctx = MinimaxStrategy._LayerContext(
+            battle=battle,
+            sim=sim,
+            system_prompt_layered=self.layered_system_prompt,
+            state_prompt_ours=state_prompt,
+            state_action_prompt_ours=state_action_prompt,
+            io_player=io_player,
+            state_prompt_opp=state_prompt_o,
+            state_action_prompt_opp=state_action_prompt_o,
+            io_opp=io_opp,
+        )
+        # Define layers
+        layers = [
+            MinimaxStrategy._L1StrategyLayer(),
+            MinimaxStrategy._L2ThreatsLayer(),
+            MinimaxStrategy._L3TacticsLayer(),
+            MinimaxStrategy._L4ActionsLayer(),
+        ]
+        # Execute sequentially
+        for layer in layers:
+            tasks = layer.build_tasks(ctx)
+            parse_actions = getattr(layer, "parse_actions", False)
+            results = self._run_llm_tasks(retries, ctx, tasks, parse_actions)
+            # Aggregate results
+            if parse_actions:
+                # Each result is a BattleOrder (or None)
+                for key, res in results.items():
+                    if res is None:
+                        continue
+                    try:
+                        # LLMPlayer.io returns a BattleOrder
+                        if isinstance(res, BattleOrder):
+                            if key.endswith("opp_most_likely"):
+                                if not any(getattr(x, 'message', None) == res.message for x in ctx.opponent_actions):
+                                    ctx.opponent_actions.append(res)
+                            else:
+                                if not any(getattr(x, 'message', None) == res.message for x in ctx.player_actions):
+                                    ctx.player_actions.append(res)
+                    except Exception:
+                        pass
+            else:
+                # Text aggregation: register per-key
+                for key, out in results.items():
+                    if isinstance(out, tuple):
+                        # Some backends may return (text, flag); take first
+                        out = out[0]
+                    if out is None:
+                        out = ""
+                    ctx.register_text(key, str(out))
+        return ctx.player_actions, ctx.opponent_actions
 
     def _parallel_gpt_root_calls(
         self,
@@ -170,26 +380,38 @@ class MinimaxStrategy(DecisionStrategy):
         have_switch: bool,
         have_move: bool,
     ):
-        """Run 7 independent root LLM calls in parallel to propose actions.
+        """Run 7 independent root LLM calls with delayed hedging.
+
+        For each prompt key, we:
+        - Fire the primary (root_model) immediately.
+        - After a brief delay, submit a secondary (child_model) if no primary result yet.
+        - Accept the primary if it returns within the overall LLM budget; otherwise
+          keep the secondary. We proceed as soon as all keys have at least one
+          result or the budget expires.
 
         Returns: (player_suggestions: list[BattleOrder], opponent_suggestions: list[BattleOrder])
         """
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import threading
+        from time import perf_counter
         # Determine IO constraint for our side based on availability
+        conf_clause = ' Include a field "decision_confidence" containing low/med/high.'
         if have_move and have_switch:
-            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON like: {"move":"<move_name>"} or {"switch":"<switch_pokemon_name>"}.\n'
+            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON object containing either {"move":"<move_name>"} or {"switch":"<switch_pokemon_name>"}.' + conf_clause + "\n"
         elif have_move:
-            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON like: {"move":"<move_name>"}.\n'
+            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON object like {"move":"<move_name>"}.' + conf_clause + "\n"
         else:
-            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON like: {"switch":"<switch_pokemon_name>"}.\n'
+            constraint_prompt_io_player = 'Choose the best action and your output MUST be a JSON object like {"switch":"<switch_pokemon_name>"}.' + conf_clause + "\n"
 
-        ours_threat = "\n[THREAT ANALYSIS] Are we at under threats that must be answered immediately? Examples: opponent is stacking buffs, our active Pokémon loses badly in the current matchup, etc. If we are, reply with our action that best answers the threat. If not, reply with NONE.\n"
-        ours_maintain = "\n[MOMENTUM ANALYSIS] Do we pose immediate danger? Examples: do we have a Pokémon with multiple buffs stacked, are we applying OHK pressure on the opponent's active pokemon, etc. If we do, what would be our best action to maintain our lead? If we don't, reply with NONE.\n"
-        ours_longterm = "\n[LONGTERM ADVANTAGE ANALYSIS] What action would best enable us to gain a long-term advantage? For instance, buffing our team or debuffing the opponent? If you don't identify any good options, reply with NONE\n"
-        ours_surprise = "\n[MINDGAMES ANALYSIS] What decision should we make if we want to catch the opponent off-guard while avoiding risk?\n"
+        # These will run in LLM calls that will suggest an action to take
+        ours_threat = "\n[DAMAGE] What's our best damaging move against the opponent's active Pokémon this turn?\n"
+        ours_maintain = "\n[NON-DAMAGING] What's our best non-damaging move available this turn (e.g. apply a buff or debuff, heal, etc.)?\n"
+        ours_longterm = "\n[DAMAGE SWITCH] Let's assume the opponent is guaranteed to switch their active Pokémon. What's our best damaging move against their most likely switch option?\n"
+        ours_surprise = "\n[SWITCH] What is our best Pokémon to switch to against the opponent's active Pokémon?\n"
 
-        opp_threat = "\n[OPP THREAT ANALYSIS] Is the opponent under threats that must be answered immediately? Examples: we are stacking buffs, the opponent's active Pokémon loses badly in the current matchup, etc. If not, reply with NONE\n"
-        opp_maintain = "\n[OPP MOMENTUM ANALYSIS] Does the opponent pose immediate danger to us? Examples: they have a Pokémon with multiple buffs stacked, they are applying OHK pressure on our active pokemon, etc. If they do, what would be their best possible decision if they wanted to maintain their lead? If not, reply with NONE\n"
-        opp_longterm = "\n[OPP LONGTERM ADVANTAGE ANALYSIS] What action would be best to enable the opponent to gain a long-term advantage? For instance, buffing their team or debuffing ours? If you don't identify any good options, reply with NONE\n"
+        opp_threat = "\n[OPP DAMAGE] What's our opponent's best damaging move available?\n"
+        opp_maintain = "\n[OPP NON-DAMAGING] What's our opponent's best non-damaging move available this turn (e.g. apply a buff or debuff, heal, etc.)?\n"
+        opp_longterm = "\n[OPP SWITCH] What's our opponent's best switch option available against our active Pokémon?\n"
 
         # Compose full prompts
         ours_prompts = [
@@ -213,71 +435,152 @@ class MinimaxStrategy(DecisionStrategy):
             except Exception:
                 return "<unprintable>"
 
-        with ThreadPoolExecutor(max_workers=7) as ex:
-            futures = {}
-            # Our side submissions
-            for key, prompt in ours_prompts:
-                print(
-                    f"[LLM START] type={key} sys='{_trim(system_prompt)}' state='{_trim(state_prompt)}' io='{_trim(constraint_prompt_io_player)}' act='{_trim(prompt)}'",
-                    flush=True,
-                )
-                futures[key] = ex.submit(
-                    self.io,
-                    retries,
-                    system_prompt,
-                    state_prompt,
-                    constraint_prompt_cot,
-                    constraint_prompt_io_player,
-                    prompt,
-                    battle,
-                    sim,
-                    False,
-                    None,
-                    self.root_model,
-                )
-            # Opponent submissions
-            for key, prompt in opp_prompts:
-                print(
-                    f"[LLM START] type={key} sys='{_trim(system_prompt_o)}' state='{_trim(state_prompt_o)}' io='{_trim(constraint_prompt_io_o)}' act='{_trim(prompt)}'",
-                    flush=True,
-                )
-                futures[key] = ex.submit(
-                    self.io,
-                    2,
-                    system_prompt_o,
-                    state_prompt_o,
-                    constraint_prompt_cot_o,
-                    constraint_prompt_io_o,
-                    prompt,
-                    battle,
-                    sim,
-                    True,
-                    None,
-                    self.root_model,
-                )
+        # Hedging parameters
+        HEDGE_DELAY = 4.0  # seconds before launching secondary
+        LLM_BUDGET = 27.0  # overall time budget for all root calls in seconds
 
-            # Collect
-            for key, fut in futures.items():
+        start_t = perf_counter()
+        ex = ThreadPoolExecutor(max_workers=10)
+        try:
+            # Track futures and winners
+            # meta: future -> (key, tier, is_opp)
+            meta = {}
+            # winners: key -> {'res': BattleOrder, 'tier': 'primary'|'secondary'}
+            winners = {}
+
+            def _submit(key: str, prompt: str, *, is_opp: bool, tier: str):
+                # Log
+                if not is_opp:
+                    return ex.submit(
+                        self.io,
+                        retries,
+                        system_prompt,
+                        state_prompt,
+                        constraint_prompt_cot,
+                        constraint_prompt_io_player,
+                        prompt,
+                        battle,
+                        sim,
+                        False,
+                        None,
+                        (self.root_model if tier == 'primary' else self.child_model),
+                    )
+                else:
+                    # Append confidence clause for opponent as well without mutating caller's string
+                    io_o_with_conf = (constraint_prompt_io_o or '') + conf_clause
+                    return ex.submit(
+                        self.io,
+                        2,
+                        system_prompt_o,
+                        state_prompt_o,
+                        constraint_prompt_cot_o,
+                        io_o_with_conf,
+                        prompt,
+                        battle,
+                        sim,
+                        True,
+                        None,
+                        (self.root_model if tier == 'primary' else self.child_model),
+                    )
+
+            # Submit primaries
+            pending = set()
+            for key, prompt in ours_prompts:
+                fut = _submit(key, prompt, is_opp=False, tier='primary')
+                meta[fut] = (key, 'primary', False)
+                pending.add(fut)
+            for key, prompt in opp_prompts:
+                fut = _submit(key, prompt, is_opp=True, tier='primary')
+                meta[fut] = (key, 'primary', True)
+                pending.add(fut)
+
+            # After short delay, submit secondaries for keys without results
+            # Wait HEDGE_DELAY for any primaries to complete
+            wait(pending, timeout=HEDGE_DELAY, return_when=FIRST_COMPLETED)
+            # Determine which keys still pending
+            prim_keys_pending = set()
+            for fut in list(pending):
+                k, tier, _ = meta[fut]
+                if tier == 'primary' and not fut.done():
+                    prim_keys_pending.add(k)
+            # Submit secondaries only for keys whose primary not done
+            for key, prompt in ours_prompts:
+                if key in prim_keys_pending:
+                    fut = _submit(key, prompt, is_opp=False, tier='secondary')
+                    meta[fut] = (key, 'secondary', False)
+                    pending.add(fut)
+            for key, prompt in opp_prompts:
+                if key in prim_keys_pending:
+                    fut = _submit(key, prompt, is_opp=True, tier='secondary')
+                    meta[fut] = (key, 'secondary', True)
+                    pending.add(fut)
+
+            # Helper to accept a result (prefer primary if it arrives later within budget)
+            def _accept_result(k: str, tier: str, is_opp: bool, res):
+                if res is None:
+                    return
                 try:
-                    res = fut.result()
+                    msg = getattr(res, 'message', str(res))
+                    conf = getattr(res, 'decision_confidence', None)
+                    extra = f" conf={conf}" if conf is not None else ""
+                    print(f"[LLM DONE] type={k} model={tier} resp='{msg}'{extra}", flush=True)
                 except Exception:
-                    res = None
+                    pass
+                prev = winners.get(k)
+                if prev is None:
+                    winners[k] = {'res': res, 'tier': tier, 'is_opp': is_opp}
+                else:
+                    # If previous was secondary and new is primary within budget, prefer primary
+                    if prev['tier'] == 'secondary' and tier == 'primary':
+                        winners[k] = {'res': res, 'tier': tier, 'is_opp': is_opp}
+
+            # Collect until all keys have a winner or budget expires
+            all_keys = {k for k, _ in ours_prompts} | {k for k, _ in opp_prompts}
+            while True:
+                if set(winners.keys()) == all_keys:
+                    break
+                remaining = LLM_BUDGET - (perf_counter() - start_t)
+                if remaining <= 0.0:
+                    break
+                done, not_done = wait(pending, timeout=min(0.5, remaining), return_when=FIRST_COMPLETED)
+                for fut in list(done):
+                    pending.discard(fut)
+                    k, tier, is_opp = meta.get(fut, (None, None, None))
+                    if k is None:
+                        continue
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = None
+                    _accept_result(k, tier, is_opp, res)
+
+                if not done and not pending:
+                    break
+
+            # Build suggestion lists from winners (dedupe by message)
+            for k, rec in winners.items():
+                res = rec['res']
+                is_opp = rec['is_opp']
                 if res is None:
                     continue
                 try:
-                    msg = getattr(res, 'message', str(res))
-                    print(f"[LLM DONE] type={key} resp='{msg}'", flush=True)
+                    if not is_opp:
+                        if not any(getattr(x, 'message', None) == getattr(res, 'message', None) for x in player_suggestions):
+                            player_suggestions.append(res)
+                    else:
+                        if not any(getattr(x, 'message', None) == getattr(res, 'message', None) for x in opponent_suggestions):
+                            opponent_suggestions.append(res)
                 except Exception:
                     pass
-                if key.startswith("our_"):
-                    # de-dup by message
-                    if not any(getattr(x, 'message', None) == getattr(res, 'message', None) for x in player_suggestions):
-                        player_suggestions.append(res)
-                else:
-                    if not any(getattr(x, 'message', None) == getattr(res, 'message', None) for x in opponent_suggestions):
-                        opponent_suggestions.append(res)
 
-        return player_suggestions, opponent_suggestions
+            return player_suggestions, opponent_suggestions
+        finally:
+            # Do not block on slow stragglers; cancel queued tasks and return immediately
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python <3.9 compatibility: cancel_futures not supported
+                ex.shutdown(wait=False)
 
     def _get_cached_llm_value(self, battle: Battle) -> Optional[int]:
         """Get cached LLM evaluation for a battle state."""
@@ -572,44 +875,41 @@ class MinimaxStrategy(DecisionStrategy):
         try:
             if self.use_metamon_value_function:
                 from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
-                # Only manage contexts when using trajectory-based mode
-                if getattr(_MB, "_mode", "timestep") == "traj":
+                try:
+                    if getattr(_MB, "has_context", None) and _MB.has_context(root.simulation.battle):
+                        _MB.sync_context(root.simulation.battle, battle)
+                        if os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}:
+                            try:
+                                print(
+                                    f"[Minimax] root sync parent_id={id(battle)} child_id={id(root.simulation.battle)}",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
+                    else:
+                        _MB.clone_context(battle, root.simulation.battle)
+                        if os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}:
+                            try:
+                                print(
+                                    f"[Minimax] root clone parent_id={id(battle)} child_id={id(root.simulation.battle)}",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    # Fallback to clone on any unexpected error
                     try:
-                        if getattr(_MB, "has_context", None) and _MB.has_context(root.simulation.battle):
-                            _MB.sync_context(root.simulation.battle, battle)
-                            if os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}:
-                                try:
-                                    print(
-                                        f"[Minimax] root sync parent_id={id(battle)} child_id={id(root.simulation.battle)}",
-                                        flush=True,
-                                    )
-                                except Exception:
-                                    pass
-                        else:
-                            _MB.clone_context(battle, root.simulation.battle)
-                            if os.getenv("POKECHAMP_MINIMAX_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}:
-                                try:
-                                    print(
-                                        f"[Minimax] root clone parent_id={id(battle)} child_id={id(root.simulation.battle)}",
-                                        flush=True,
-                                    )
-                                except Exception:
-                                    pass
+                        _MB.clone_context(battle, root.simulation.battle)
                     except Exception:
-                        # Fallback to clone on any unexpected error
-                        try:
-                            _MB.clone_context(battle, root.simulation.battle)
-                        except Exception:
-                            pass
+                        pass
         except Exception:
             pass
 
         q = [root]
         leaf_nodes = []
-        start_time = time.time()
+        start_time = perf_counter()
         timing_on = os.getenv("POKECHAMP_TIMING_LOG", "0").lower() in {"1", "true", "t", "yes", "y"}
         if timing_on:
-            from time import perf_counter
             t_llm_total = 0.0
             t_expand_copy = 0.0
             t_expand_init = 0.0
@@ -649,16 +949,7 @@ class MinimaxStrategy(DecisionStrategy):
             player_actions = []
             opponent_actions = []
             system_prompt, state_prompt, constraint_prompt_cot, constraint_prompt_io, state_action_prompt, action_prompt_switch, action_prompt_move = node.simulation.get_player_prompt(return_actions=True)
-            # Append latest strategy (single block) to the system prompt if available
-            try:
-                # TODO: does the LLM know whether the player is p1 or p2?
-                if getattr(self, 'get_strategy_text', None) is not None:
-                    _st = self.get_strategy_text(node.simulation.battle)
-                    if isinstance(_st, str) and _st.strip():
-                        system_prompt = f"{system_prompt}\n\nTeam Strategy:\n{_st.strip()}"
-                        print(f'system prompt with strategy: {system_prompt}')
-            except Exception:
-                pass
+            # Layered orchestration: do not append background strategy to system prompt
 
             # End if terminal
             if node.simulation.is_terminal() or node.depth == self.K:
@@ -838,112 +1129,116 @@ class MinimaxStrategy(DecisionStrategy):
                             return dmg_calc_out, action_opp
                     player_actions.append(dmg_calc_out)
 
-            # TODO: are the LLM calls in child nodes being done sequentially? that would be terrible
-            # Optionally parallelize GPT root LLM calls (switches, move, opponent)
+            # Root: use Metamon policy priors instead of LLM suggestions
             did_parallel_root = False
-            parallelize_root = (
-                node.depth == 1
-                and isinstance(self.backend, str)
-                and (
-                    ("gpt" in self.backend.lower())
-                    or ("gemini" in self.backend.lower())
-                    or ("google/" in self.backend.lower())
-                )
-            )
-            if parallelize_root:
-                # Prepare opponent prompts
-                system_prompt_o, state_prompt_o, constraint_prompt_cot_o, constraint_prompt_io_o, state_action_prompt_o = node.simulation.get_opponent_prompt(system_prompt)
-                have_switch = len(node.simulation.battle.available_switches) != 0
-                have_move = (not node.simulation.battle.active_pokemon.fainted) and (len(node.simulation.battle.available_moves) > 0)
-
-                # TODO: we should append analyses: "are we at immediate danger (opp stacking buffs, bad matchup, etc)?" "what is the opponent expecting?" "do we have kill potential?", can we abuse anything(stack buffs, tera, etc)
-                _tllm0 = perf_counter() if timing_on and node.depth == 1 else None
-                player_llm_suggestions, opponent_llm_suggestions = self._parallel_gpt_root_calls(
-                    retries,
-                    system_prompt=system_prompt,
-                    state_prompt=state_prompt,
-                    constraint_prompt_cot=constraint_prompt_cot,
-                    state_action_prompt=state_action_prompt,
-                    action_prompt_switch=action_prompt_switch,
-                    action_prompt_move=action_prompt_move,
-                    battle=node.simulation.battle,
-                    sim=node.simulation,
-                    system_prompt_o=system_prompt_o,
-                    state_prompt_o=state_prompt_o,
-                    constraint_prompt_cot_o=constraint_prompt_cot_o,
-                    constraint_prompt_io_o=constraint_prompt_io_o,
-                    state_action_prompt_o=state_action_prompt_o,
-                    have_switch=have_switch,
-                    have_move=have_move,
-                )
-                if timing_on and _tllm0 is not None:
-                    t_llm_total += (perf_counter() - _tllm0)
-
-                # Append our LLM suggestions (dedupe by message)
-                for act in player_llm_suggestions or []:
+            if node.depth == 1:
+                try:
+                    from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
+                    top_n = int(os.getenv("POKECHAMP_METAMON_PRIORS_TOP_N", 3))
                     try:
-                        if not any(getattr(x, 'message', None) == getattr(act, 'message', None) for x in player_actions):
-                            player_actions.append(act)
+                        print(f"[MetamonPriorsDBG] calling policy_top_n_traj topN={top_n} turn={getattr(node.simulation.battle,'turn','?')} battle_id={id(node.simulation.battle)}", flush=True)
                     except Exception:
                         pass
-
-                # Build opponent actions baseline
-                opponent_actions = []
-                tool_is_optimal = False
-                if action_opp is not None:
-                    tool_is_optimal = True
-                    opponent_actions.append(self.create_order(action_opp))
-
-                best_score = np.inf
-                best_action = None
-                for mon in node.simulation.battle.opponent_team.values():
-                    if mon.species == node.simulation.battle.opponent_active_pokemon.species:
-                        continue
-                    score = self._estimate_matchup(mon, node.simulation.battle.active_pokemon)
-                    if score < best_score:
-                        best_score = score
-                        best_action = mon
-                if best_action is not None:
-                    opponent_actions.append(self.create_order(best_action))
-
-                # Append opponent LLM suggestions (dedupe by message)
-                for act in opponent_llm_suggestions or []:
+                    # Get raw indices + probs for logging
+                    pairs = _MB.policy_top_n_traj(node.simulation.battle, top_n=top_n)
+                    # Always-on, concise logs to understand behavior
                     try:
-                        is_repeat_action_o = np.array([getattr(act, 'message', None) == getattr(opponent_action, 'message', None) for opponent_action in opponent_actions]).any()
-                        if not is_repeat_action_o:
-                            opponent_actions.append(act)
+                        idxs = [int(i) for (i, _p) in pairs]
+                        probs = [round(float(p), 4) for (_i, p) in pairs]
+                        print(f"[MetamonPriors] turn={getattr(node.simulation.battle,'turn','?')} topN idx={idxs} probs={probs}", flush=True)
                     except Exception:
                         pass
-
-                did_parallel_root = True
-
-            # Sequential root LLM path removed: rely on parallel suggestions (if any)
+                    # Map to local orders (avoid duplicate actor call)
+                    priors_orders = []
+                    for idx, _p in pairs:
+                        try:
+                            bo = _MB._action_idx_to_order_local(node.simulation.battle, int(idx))
+                        except Exception:
+                            bo = None
+                        if bo is not None:
+                            priors_orders.append(bo)
+                    # Log mapped orders
+                    try:
+                        msgs = [getattr(o, 'message', str(o)) for o in priors_orders]
+                        print(f"[MetamonPriors] orders={msgs}", flush=True)
+                    except Exception:
+                        pass
+                    for act in priors_orders:
+                        try:
+                            if not any(getattr(x, 'message', None) == getattr(act, 'message', None) for x in player_actions):
+                                player_actions.append(act)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    # Propagate errors for explicit failure unless explicitly ignored elsewhere
+                    raise
 
             ##############################
             # Generate opponent's action #
             ##############################
             # Build baseline opponent actions (always)
-            if action_opp is not None:
-                try:
-                    opponent_actions.append(self.create_order(action_opp))
-                except Exception:
-                    pass
+            if not did_parallel_root:
+                if action_opp is not None:
+                    try:
+                        opponent_actions.append(self.create_order(action_opp))
+                    except Exception:
+                        pass
+
+            # Add all opponent switch options (simple, no cap). We gather every
+            # benched, non-fainted opponent Pokémon and create a switch order for
+            # each, then deduplicate by order.message to avoid duplicates with the
+            # heuristic switch below or baseline action.
+            try:
+                existing_msgs = {getattr(o, 'message', None) for o in opponent_actions}
+                for mon in node.simulation.battle.opponent_team.values():
+                    # Skip active and fainted/0-HP mons
+                    if mon.species == node.simulation.battle.opponent_active_pokemon.species:
+                        continue
+                    try:
+                        if getattr(mon, 'fainted', False) or getattr(mon, 'current_hp', 0) <= 0:
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        bo = self.create_order(mon)
+                        if bo is None:
+                            continue
+                        msg = getattr(bo, 'message', None)
+                        if msg not in existing_msgs:
+                            opponent_actions.append(bo)
+                            existing_msgs.add(msg)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # Heuristic matchup switch action
             best_score = np.inf
             best_action = None
             for mon in node.simulation.battle.opponent_team.values():
+                # Skip current active and any fainted/inactive candidates
                 if mon.species == node.simulation.battle.opponent_active_pokemon.species:
                     continue
+                try:
+                    if getattr(mon, 'fainted', False) or getattr(mon, 'current_hp', 0) <= 0:
+                        continue
+                except Exception:
+                    pass
                 score = self._estimate_matchup(mon, node.simulation.battle.active_pokemon)
                 if score < best_score:
                     best_score = score
                     best_action = mon
-            if best_action is not None:
-                try:
-                    opponent_actions.append(self.create_order(best_action))
-                except Exception:
-                    pass
+            if not did_parallel_root:
+                if best_action is not None:
+                    try:
+                        bo = self.create_order(best_action)
+                        # Avoid inserting a duplicate entry if we already added this switch
+                        if bo is not None:
+                            msg = getattr(bo, 'message', None)
+                            if not any(getattr(x, 'message', None) == msg for x in opponent_actions):
+                                opponent_actions.append(bo)
+                    except Exception:
+                        pass
 
             # Simulate outcome
             print('simulate outcome')
@@ -984,15 +1279,14 @@ class MinimaxStrategy(DecisionStrategy):
                         try:
                             if self.use_metamon_value_function:
                                 from pokechamp.metamon_bridge import METAMON_BRIDGE as _MB
-                                if getattr(_MB, "_mode", "timestep") == "traj":
-                                    if _log_on and node.depth == 1:
-                                        try:
-                                            _log(
-                                                f"child-create parent_id={id(node.simulation.battle)} child_id={id(node_new.simulation.battle)} P={str(getattr(action_p,'order',action_p))} O={str(getattr(action_o,'order',action_o))}"
-                                            )
-                                        except Exception:
-                                            pass
-                                    _MB.clone_context(node.simulation.battle, node_new.simulation.battle)
+                                if _log_on and node.depth == 1:
+                                    try:
+                                        _log(
+                                            f"child-create parent_id={id(node.simulation.battle)} child_id={id(node_new.simulation.battle)} P={str(getattr(action_p,'order',action_p))} O={str(getattr(action_o,'order',action_o))}"
+                                        )
+                                    except Exception:
+                                        pass
+                                _MB.clone_context(node.simulation.battle, node_new.simulation.battle)
                         except Exception:
                             pass
                         node_new.action = action_p
@@ -1045,7 +1339,7 @@ class MinimaxStrategy(DecisionStrategy):
             return action_dict[best_action_str], score_dict[best_action_str], opp_dict[best_action_str]
 
         action, best_score, action_opp = get_tree_action(root)
-        end_time = time.time()
+        end_time = perf_counter()
 
         # Release ephemeral Metamon contexts created during this search
         try:

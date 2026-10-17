@@ -918,18 +918,26 @@ class Pokemon:
     
     def guess_tera(self, guess_type='most_likely'):
         sets = self._sets
-        if self.species.lower() not in sets:
-            return ''
+        key = self.species.lower()
+        if key not in sets:
+            # Fallback for Tera-suffixed Showdown IDs (e.g., ogerponwellspringtera)
+            if key.endswith('tera') and key[:-4] in sets:
+                key = key[:-4]
+            else:
+                return ''
 
         if guess_type == 'most_likely':
             # most likely based on stats
-            set = sets[self.species.lower()]['tera'][0]
+            set = sets[key]['tera'][0]
             tera = set['name']
         
         else:
             # statistically weighted choice (copy paste lol)
             def get_weighted_choice(category, id, size=1):
-                category_dict = sets[self.species.lower()][category]
+                k = key
+                if k not in sets and k.endswith('tera') and k[:-4] in sets:
+                    k = k[:-4]
+                category_dict = sets.get(k, {}).get(category, [])
                 p = np.array([float(category_dict[i]['percentage'])/100. for i in range(len(category_dict))])
                 p = p / p.sum()
                 if size > len(category_dict):
@@ -968,15 +976,21 @@ class Pokemon:
         # Original implementation
         stat_types = ['hp', 'atk', 'def', 'spa', 'spd', 'spe']
         sets = self._sets
+        key = self.species.lower()
+        if key not in sets and key.endswith('tera') and key[:-4] in sets:
+            key = key[:-4]
         if guess_type == 'most_likely':
             # most likely based on statistics
-            set = sets[self.species.lower()]['spreads'][0]
+            set = sets[key]['spreads'][0]
             spread = set['stats']
             nature = set['nature']
         else:
             # statistically weighted choice
             def get_weighted_choice(category, id, size=1):
-                category_dict = sets[self.species.lower()][category]
+                k = self.species.lower()
+                if k not in sets and k.endswith('tera') and k[:-4] in sets:
+                    k = k[:-4]
+                category_dict = sets.get(k, {}).get(category, [])
                 p = np.array([float(category_dict[i]['percentage'])/100. for i in range(len(category_dict))])
                 p = p / p.sum()
                 if size > len(category_dict):
@@ -1013,7 +1027,9 @@ class Pokemon:
                 'brutebonnet': 'Brute Bonnet', 'fluttermane': 'Flutter Mane', 'slitherwing': 'Slither Wing',
                 'sandyshocks': 'Sandy Shocks', 'roaringmoon': 'Roaring Moon', 'walkingwake': 'Walking Wake',
                 'ragingbolt': 'Raging Bolt', 'gougingfire': 'Gouging Fire', 'ogerponwellspring': 'Ogerpon-Wellspring',
-                'ogerponhearthflame': 'Ogerpon-Hearthflame', 'ogerponcornerstone': 'Ogerpon-Cornerstone',
+                'ogerponwellspringtera': 'Ogerpon-Wellspring',
+                'ogerponhearthflame': 'Ogerpon-Hearthflame', 'ogerponhearthflametera': 'Ogerpon-Hearthflame',
+                'ogerponcornerstone': 'Ogerpon-Cornerstone', 'ogerponcornerstonetera': 'Ogerpon-Cornerstone',
                 'ogerponteal': 'Ogerpon', 'ogerpontealtera': 'Ogerpon', 'ursalunabloodmoon': 'Ursaluna',
                 'ninetalesalola': 'Ninetales-Alola', 'sandslashalola': 'Sandslash-Alola',
                 'tapukoko': 'Zapdos', 'tapulele': 'Clefable', 'tapubulu': 'Zapdos',

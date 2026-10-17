@@ -592,7 +592,7 @@ def get_avail_actions(sim: LocalSim,
     #     if battle.can_tera and not battle._tera_intent:
     #         move_choices.append('terastallize')
 
-    action_prompt_move = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose only from the following action choices:\n'
+    action_prompt_move = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose the best action to take this turn:\n'
     if len(move_choices) > 0:
         action_prompt_move += f"[<move_name>] = {move_choices}\n"
 
@@ -1005,7 +1005,7 @@ def state_translate(sim: LocalSim,
             move_prompt += "\n"
 
     move_choices = [move.id for move in battle.available_moves]
-    action_prompt = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose only from the following action choices:\n'
+    action_prompt = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose the best action to take this turn:\n'
     action_prompt_move = ''
     if len(move_choices) > 0:
         action_prompt_move = f"[<move_name>] = {move_choices}\n"
@@ -1496,7 +1496,7 @@ def state_translate2(sim: LocalSim,
             move_prompt += "\n"
 
     move_choices = [move.id for move in battle.available_moves]
-    action_prompt = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose only from the following action choices:\n'
+    action_prompt = f' Your current Pokemon: {battle.active_pokemon.species}.\nChoose the best action to take this turn:\n'
     action_prompt_move = ''
     if len(move_choices) > 0:
         action_prompt_move = f"[<move_name>] = {move_choices}\n"

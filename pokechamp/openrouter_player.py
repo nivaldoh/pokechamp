@@ -139,3 +139,130 @@ class OpenRouterPlayer():
             if len(message_json) > 0:
                 return message_json, True
         return message, False 
+
+    async def get_LLM_action_with_mcp(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        mcp_client,
+        model: str = 'openai/gpt-4o',
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+        max_tool_calls: int = 10
+    ) -> str:
+        """Get LLM action via OpenRouter using MCP tools."""
+
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.api_key,
+        )
+
+        # Convert MCP tools to OpenAI function format
+        tools = []
+        for tool in mcp_client.get_tools_list():
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {})
+                }
+            })
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        tool_call_count = 0
+
+        while tool_call_count < max_tool_calls:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools if tools else None,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra_headers={
+                        "HTTP-Referer": self.site_url,
+                        "X-Title": self.site_name,
+                    }
+                )
+
+                self.completion_tokens += response.usage.completion_tokens
+                self.prompt_tokens += response.usage.prompt_tokens
+
+                message = response.choices[0].message
+
+                if message.tool_calls:
+                    messages.append({
+                        "role": "assistant",
+                        "content": message.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            }
+                            for tc in message.tool_calls
+                        ]
+                    })
+
+                    for tool_call in message.tool_calls:
+                        tool_name = tool_call.function.name
+                        try:
+                            arguments = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            arguments = {}
+
+                        try:
+                            result = await mcp_client.call_tool(tool_name, arguments)
+                        except Exception as e:
+                            result = {"error": str(e)}
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(result)
+                        })
+
+                    tool_call_count += 1
+                else:
+                    return message.content if message.content else ""
+
+            except RateLimitError:
+                sleep(5)
+                print('OpenRouter rate limit error in MCP mode')
+                continue
+            except Exception as e:
+                print(f'OpenRouter MCP call failed: {e}')
+                if messages:
+                    return json.dumps({"error": str(e)})
+                raise
+
+        # After exhausting tool calls, request final answer
+        messages.append({
+            "role": "user",
+            "content": "You've used many tools. Please provide the final decision as JSON: {\"move\":\"<name>\"} or {\"switch\":\"<name>\"}."
+        })
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_headers={
+                    "HTTP-Referer": self.site_url,
+                    "X-Title": self.site_name,
+                }
+            )
+            self.completion_tokens += response.usage.completion_tokens
+            self.prompt_tokens += response.usage.prompt_tokens
+            return response.choices[0].message.content
+        except Exception as e:
+            return json.dumps({"error": f"unable to obtain final decision: {e}"})
